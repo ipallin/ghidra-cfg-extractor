@@ -73,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="output_dir",
         type=Path,
         default=Path("cfg-output"),
-        help="Directory where the CFG JSON files will be stored.",
+        help="Directory where the CFG export files will be stored.",
     )
     parser.add_argument(
         "--keep-project",
@@ -100,6 +100,21 @@ def build_parser() -> argparse.ArgumentParser:
             "Defaults to the script that ships with this repository."
         ),
     )
+    parser.add_argument(
+        "--language-id",
+        dest="language_id",
+        help=(
+            "Override the processor/language that Ghidra should use when "
+            "importing the binary (e.g. 'x86:LE:32:default')."
+        ),
+    )
+    parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("json", "graphml"),
+        default="json",
+        help="Format of the exported control-flow graphs. Defaults to json.",
+    )
     return parser
 
 
@@ -110,19 +125,32 @@ def _build_analyze_command(
     binary: Path,
     script_path: Path,
     output_path: Path,
+    output_format: str,
+    language_id: str | None = None,
 ) -> List[str]:
-    return [
+    command = [
         str(analyze_headless),
         str(project_dir),
         project_name,
         "-import",
         str(binary),
-        "-scriptPath",
-        str(script_path.parent),
-        "-postScript",
-        script_path.name,
-        str(output_path),
     ]
+
+    if language_id:
+        command.extend(["-processor", language_id])
+
+    command.extend(
+        [
+            "-scriptPath",
+            str(script_path.parent),
+            "-postScript",
+            script_path.name,
+            str(output_path),
+            output_format,
+        ]
+    )
+
+    return command
 
 
 def run_analysis(
@@ -130,8 +158,10 @@ def run_analysis(
     ghidra_install: Path,
     output_dir: Path,
     script_path: Path,
+    output_format: str,
     keep_project: bool = False,
     overwrite: bool = False,
+    language_id: str | None = None,
 ) -> None:
     if not ghidra_install:
         raise ValueError(
@@ -152,7 +182,7 @@ def run_analysis(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for binary in binaries:
-        output_path = output_dir / (binary.name + ".cfg.json")
+        output_path = output_dir / (binary.name + ".cfg." + output_format)
         if output_path.exists() and not overwrite:
             raise FileExistsError(
                 f"Output file {output_path} already exists. Use --overwrite to replace it."
@@ -161,7 +191,7 @@ def run_analysis(
     for binary in binaries:
         project_dir = Path(tempfile.mkdtemp(prefix="ghidra_cfg_"))
         project_name = binary.stem
-        output_path = output_dir / (binary.name + ".cfg.json")
+        output_path = output_dir / (binary.name + ".cfg." + output_format)
 
         command = _build_analyze_command(
             analyze_headless=analyze_headless,
@@ -170,6 +200,8 @@ def run_analysis(
             binary=binary,
             script_path=script_path,
             output_path=output_path,
+            output_format=output_format,
+            language_id=language_id,
         )
 
         print("[+] Running:", " ".join(command))
@@ -195,8 +227,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             ghidra_install=args.ghidra_install,
             output_dir=args.output_dir,
             script_path=args.script,
+            output_format=args.output_format,
             keep_project=args.keep_project,
             overwrite=args.overwrite,
+            language_id=args.language_id,
         )
     except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as exc:
         parser.error(str(exc))
