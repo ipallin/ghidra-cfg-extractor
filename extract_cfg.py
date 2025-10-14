@@ -112,8 +112,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--format",
         dest="output_format",
         choices=("json", "graphml"),
-        default="json",
-        help="Format of the exported control-flow graphs. Defaults to json.",
+        default="graphml",
+        help="Format of the exported control-flow graphs. Defaults to graphml.",
+    )
+    parser.add_argument(
+        "--entry-address",
+        dest="entry_address",
+        help=(
+            "Optional address for the entry function to export when the loader "
+            "cannot resolve main automatically (e.g. 0x401000)."
+        ),
     )
     return parser
 
@@ -127,6 +135,7 @@ def _build_analyze_command(
     output_path: Path,
     output_format: str,
     language_id: str | None = None,
+    entry_address: str | None = None,
 ) -> List[str]:
     command = [
         str(analyze_headless),
@@ -150,6 +159,9 @@ def _build_analyze_command(
         ]
     )
 
+    if entry_address:
+        command.append(entry_address)
+
     return command
 
 
@@ -162,6 +174,7 @@ def run_analysis(
     keep_project: bool = False,
     overwrite: bool = False,
     language_id: str | None = None,
+    entry_address: str | None = None,
 ) -> None:
     if not ghidra_install:
         raise ValueError(
@@ -202,6 +215,7 @@ def run_analysis(
             output_path=output_path,
             output_format=output_format,
             language_id=language_id,
+            entry_address=entry_address,
         )
 
         print("[+] Running:", " ".join(command))
@@ -231,6 +245,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             keep_project=args.keep_project,
             overwrite=args.overwrite,
             language_id=args.language_id,
+            entry_address=args.entry_address,
         )
     except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as exc:
         parser.error(str(exc))

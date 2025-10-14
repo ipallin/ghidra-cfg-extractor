@@ -67,6 +67,7 @@ def _write_graphml(program_info, functions, output_path):
         ("d6", "graph", "program_name", "string"),
         ("d7", "graph", "language_id", "string"),
         ("d8", "graph", "compiler", "string"),
+        ("d9", "node", "instructions", "string"),
     ]
 
     for key_id, target, name, value_type in key_defs:
@@ -124,6 +125,14 @@ def _write_graphml(program_info, functions, output_path):
             node_size.set("key", "d3")
             node_size.text = str(block.get("size"))
 
+            instructions = block.get("instructions", [])
+            if instructions:
+                node_instr = ET.SubElement(node, "data")
+                node_instr.set("key", "d9")
+                node_instr.text = "\n".join(
+                    instr.get("representation") or "" for instr in instructions
+                )
+
         edge_index = 0
         for edge in function.get("edges", []):
             edge_elem = ET.SubElement(graph, "edge")
@@ -154,9 +163,14 @@ def run():
         return
 
     output_path = os.path.abspath(args[0])
-    output_format = "json"
+    output_format = "graphml"
     if len(args) > 1 and args[1]:
         output_format = args[1].strip().lower()
+    entry_address = None
+    if len(args) > 2 and args[2]:
+        entry_address = args[2].strip()
+        if not entry_address:
+            entry_address = None
 
     monitor = getMonitor()
     if monitor is None:
@@ -165,6 +179,7 @@ def run():
     program = currentProgram
     function_manager = program.getFunctionManager()
     block_model = SimpleBlockModel(program)
+    listing = program.getListing()
 
     program_info = {
         "name": program.getName(),
@@ -173,57 +188,103 @@ def run():
     }
     functions = []
 
-    function_iter = function_manager.getFunctions(True)
-    while function_iter.hasNext() and not monitor.isCancelled():
-        function = function_iter.next()
-        monitor.setMessage("Exporting CFG for {}".format(function.getName()))
+    target_function = None
 
-        body = function.getBody()
-        block_iter = block_model.getCodeBlocksContaining(body, monitor)
-
-        blocks = {}
-        block_list = []
-        edges = []
-
-        while block_iter.hasNext() and not monitor.isCancelled():
-            block = block_iter.next()
-            start = _as_hex(block.getFirstStartAddress())
-            end = _as_hex(block.getMaxAddress())
-            size = block.getNumAddresses()
-
-            block_info = {
-                "id": start,
-                "start": start,
-                "end": end,
-                "size": int(size),
-            }
-            block_list.append(block_info)
-            blocks[start] = block
-
-        for block_id, block in blocks.items():
-            dest_iter = block.getDestinations(monitor)
-            while dest_iter.hasNext() and not monitor.isCancelled():
-                reference = dest_iter.next()
-                dest_block = reference.getDestinationBlock()
-                if dest_block is None:
-                    continue
-                dest_id = _as_hex(dest_block.getFirstStartAddress())
-                edges.append(
-                    {
-                        "source": block_id,
-                        "target": dest_id,
-                        "type": str(reference.getFlowType()),
-                    }
+    if entry_address:
+        try:
+            address = toAddr(entry_address)
+        except Exception:  # noqa: BLE001 - ghidra provides non-standard exceptions
+            printerr("Invalid entry address '{}'.".format(entry_address))
+            return
+        target_function = function_manager.getFunctionAt(address)
+        if target_function is None:
+            printerr(
+                "No function found at entry address '{}'. Provide a valid address.".format(
+                    entry_address
                 )
+            )
+            return
+    else:
+        function_iter = function_manager.getFunctions(True)
+        while function_iter.hasNext():
+            candidate = function_iter.next()
+            if candidate.getName() == "main":
+                target_function = candidate
+                break
 
-        functions.append(
-            {
-                "name": function.getName(),
-                "entry_point": _as_hex(function.getEntryPoint()),
-                "blocks": block_list,
-                "edges": edges,
-            }
-        )
+        if target_function is None:
+            printerr(
+                "Function 'main' was not found. Re-run with --entry-address to specify its location."
+            )
+            return
+
+    monitor.setMessage("Exporting CFG for {}".format(target_function.getName()))
+
+    body = target_function.getBody()
+    block_iter = block_model.getCodeBlocksContaining(body, monitor)
+
+    blocks = {}
+    block_list = []
+    edges = []
+
+    while block_iter.hasNext() and not monitor.isCancelled():
+        block = block_iter.next()
+        start = _as_hex(block.getFirstStartAddress())
+        end = _as_hex(block.getMaxAddress())
+        size = block.getNumAddresses()
+
+        block_info = {
+            "id": start,
+            "start": start,
+            "end": end,
+            "size": int(size),
+        }
+
+        instructions = []
+        inst_iter = listing.getInstructions(block, True)
+        while inst_iter.hasNext() and not monitor.isCancelled():
+            instruction = inst_iter.next()
+            operands = []
+            for op_index in range(instruction.getNumOperands()):
+                operands.append(instruction.getDefaultOperandRepresentation(op_index))
+            instructions.append(
+                {
+                    "address": _as_hex(instruction.getAddress()),
+                    "mnemonic": instruction.getMnemonicString(),
+                    "operands": operands,
+                    "representation": instruction.toString(),
+                }
+            )
+
+        block_info["instructions"] = instructions
+
+        block_list.append(block_info)
+        blocks[start] = block
+
+    for block_id, block in blocks.items():
+        dest_iter = block.getDestinations(monitor)
+        while dest_iter.hasNext() and not monitor.isCancelled():
+            reference = dest_iter.next()
+            dest_block = reference.getDestinationBlock()
+            if dest_block is None:
+                continue
+            dest_id = _as_hex(dest_block.getFirstStartAddress())
+            edges.append(
+                {
+                    "source": block_id,
+                    "target": dest_id,
+                    "type": str(reference.getFlowType()),
+                }
+            )
+
+    functions.append(
+        {
+            "name": target_function.getName(),
+            "entry_point": _as_hex(target_function.getEntryPoint()),
+            "blocks": block_list,
+            "edges": edges,
+        }
+    )
 
     writers = {
         "json": _write_json,
