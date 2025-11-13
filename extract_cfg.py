@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import signal
 from pathlib import Path
 from typing import Iterable, List
 import zipfile
@@ -47,6 +48,26 @@ def _resolve_headless_executable(ghidra_install: Path) -> Path:
     )
 
 
+def _auto_detect_ghidra_install() -> Path | None:
+    """Try to auto-detect a Ghidra install directory by walking up from this
+    script's location and the current working directory, looking for
+    'support/analyzeHeadless'. Returns the install path or None if not found."""
+    candidates = []
+    here = Path(__file__).resolve()
+    candidates.extend(here.parents)
+    candidates.extend(Path.cwd().resolve().parents)
+
+    seen: set[Path] = set()
+    for base in candidates:
+        if base in seen:
+            continue
+        seen.add(base)
+        support = base / "support"
+        if (support / "analyzeHeadless").is_file() or (support / "analyzeHeadless.bat").is_file():
+            return base
+    return None
+
+
 def _validate_binaries(binaries: Iterable[Path]) -> List[Path]:
     resolved = []
     for binary in binaries:
@@ -55,6 +76,40 @@ def _validate_binaries(binaries: Iterable[Path]) -> List[Path]:
             raise FileNotFoundError(f"Binary '{binary}' does not exist")
         resolved.append(binary_path)
     return resolved
+
+
+def _is_likely_binary(path: Path) -> bool:
+    """Heuristically determine if a file is a compiled binary we can feed to Ghidra.
+
+    Recognizes ELF and PE (MZ) and Mach-O magic values. This is a light filter to
+    avoid passing archives, text files, or other junk to analyzeHeadless.
+    """
+    try:
+        with open(path, "rb") as f:
+            header = f.read(4)
+            if len(header) < 2:
+                return False
+            # ELF
+            if header.startswith(b"\x7fELF"):
+                return True
+            # PE/COFF (Windows)
+            if header.startswith(b"MZ"):
+                return True
+            # Mach-O (fat and thin)
+            if len(header) == 4:
+                magic = int.from_bytes(header, byteorder="big")
+                if magic in {
+                    0xFEEDFACE, 0xFEEDFACF,  # big-endian 32/64
+                    0xCAFEBABE,              # fat binary (big-endian)
+                }:
+                    return True
+                magic_le = int.from_bytes(header, byteorder="little")
+                if magic_le in {0xCEFAEDFE, 0xCFFAEDFE}:
+                    return True
+    except Exception:
+        # If we cannot read the file, treat it as not a valid binary for our purposes.
+        return False
+    return False
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -146,6 +201,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Optional address for the entry function to export when the loader "
             "cannot resolve main automatically (e.g. 0x401000)."
+        ),
+    )
+    parser.add_argument(
+        "--all-functions",
+        dest="all_functions",
+        action="store_true",
+        help=(
+            "Export CFGs for all discovered functions in each binary instead of only 'main'."
         ),
     )
     parser.add_argument(
@@ -256,7 +319,12 @@ def run_analysis(
         print("[+] Running:", " ".join(command))
         try:
             subprocess.run(command, check=True)
-            print(f"[+] CFG exported to {output_path}")
+            if output_path.exists():
+                print(f"[+] CFG exported to {output_path}")
+            else:
+                print(
+                    f"[!] No output produced for {binary}. The program may not have a 'main' function or export failed."
+                )
         finally:
             if keep_project:
                 print(f"[!] Preserving temporary project at {project_dir}")
@@ -483,23 +551,49 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    temp_dirs: List[Path] = []
+    # If no ghidra install specified or env-provided, attempt auto-detection
+    if not args.ghidra_install:
+        auto = _auto_detect_ghidra_install()
+        if auto:
+            print(f"[i] Auto-detected Ghidra installation at {auto}")
+            args.ghidra_install = auto
 
-    binaries_to_process: List[Path] = []
+    # Build a list of processing units where each unit corresponds to a single
+    # input file. If the input file is a ZIP archive it will be extracted into
+    # a temporary directory and the unit will reference that temp dir; after
+    # the unit is processed the temp dir will be removed (unless
+    # --keep-project is set). This implements "per-file" processing.
+    processing_units: List[Tuple[Path | None, List[Path]]] = []
 
-    # Gather binaries either from positional args, or from --input-dir, or both.
+    # Track all temporary dirs created while extracting archives so we can
+    # clean them up if validation fails or an early error occurs.
+    all_temp_dirs: List[Path] = []
+
+    # Inputs from --input-dir
     if args.input_dir:
-        try:
-            gathered, gathered_temp_dirs = _gather_from_input_dir(
-                args.input_dir, args.zip_password
-            )
-        except FileNotFoundError as exc:
-            parser.error(str(exc))
+        input_dir = args.input_dir.expanduser().resolve()
+        if not input_dir.exists() or not input_dir.is_dir():
+            parser.error(f"Input directory not found: {input_dir}")
             return 2
 
-        temp_dirs.extend(gathered_temp_dirs)
-        binaries_to_process.extend(gathered)
+        for entry in input_dir.iterdir():
+            if not entry.is_file():
+                continue
 
+            if zipfile.is_zipfile(entry):
+                collected, temps = _extract_zip_archive(entry, args.zip_password)
+                # remember any temp dirs created for cleanup on failure
+                all_temp_dirs.extend(temps)
+                # filter only likely binaries from the extracted files
+                filtered = [p for p in collected if _is_likely_binary(p)]
+                temp_dir = temps[0] if temps else None
+                processing_units.append((temp_dir, filtered))
+            else:
+                resolved = entry.resolve()
+                files = [resolved] if _is_likely_binary(resolved) else []
+                processing_units.append((None, files))
+
+    # Inputs from positional args
     if args.binaries:
         for provided in args.binaries:
             try:
@@ -510,42 +604,138 @@ def main(argv: Iterable[str] | None = None) -> int:
                 parser.error(str(exc))
                 return 2
 
-            temp_dirs.extend(collected_temp_dirs)
-            binaries_to_process.extend(collected)
+            # remember any temp dirs created when collecting this path
+            all_temp_dirs.extend(collected_temp_dirs)
+            # filter only likely binaries
+            filtered = [p for p in collected if _is_likely_binary(p)]
+            temp_dir = collected_temp_dirs[0] if collected_temp_dirs else None
+            processing_units.append((temp_dir, filtered))
 
-    if not binaries_to_process:
+    # Ensure there's something to do
+    if not processing_units:
         parser.error("No binaries provided. Pass paths or use --input-dir.")
         return 2
 
+    # Validate all collected binaries (flatten list)
+    all_binaries = [p for _, plist in processing_units for p in plist]
     try:
-        binaries = _validate_binaries(binaries_to_process)
+        validated = _validate_binaries(all_binaries)
     except FileNotFoundError as exc:
-        parser.error(str(exc))
-        return 2
-
-    try:
-        run_analysis(
-            binaries=binaries,
-            ghidra_install=args.ghidra_install,
-            output_dir=args.output_dir,
-            script_path=args.script,
-            output_format=args.output_format,
-            keep_project=args.keep_project,
-            overwrite=args.overwrite,
-            language_id=args.language_id,
-            entry_address=args.entry_address,
-        )
-    except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as exc:
-        parser.error(str(exc))
-        return 2
-    finally:
-        # clean up any temporary extraction dirs unless user asked to keep
-        if temp_dirs and not args.keep_project:
-            for td in temp_dirs:
+        # validation failed; clean up any extracted temp dirs before exiting
+        if all_temp_dirs and not args.keep_project:
+            for td in all_temp_dirs:
                 shutil.rmtree(td, ignore_errors=True)
 
+        parser.error(str(exc))
+        return 2
+
+    validated_set = set(validated)
+
+    # Process each unit independently: run analysis on the unit's binaries,
+    # Build a list of input entries (files only) without extracting upfront.
+    entries: List[Path] = []
+    if args.input_dir:
+        input_dir = args.input_dir.expanduser().resolve()
+        if not input_dir.exists() or not input_dir.is_dir():
+            parser.error(f"Input directory not found: {input_dir}")
+            return 2
+        for entry in input_dir.iterdir():
+            if entry.is_file():
+                entries.append(entry)
+
+    if args.binaries:
+        for provided in args.binaries:
+            p = provided.expanduser().resolve()
+            if not p.exists():
+                parser.error(f"Input path not found: {p}")
+                return 2
+            if p.is_dir():
+                for entry in p.iterdir():
+                    if entry.is_file():
+                        entries.append(entry)
+            else:
+                entries.append(p)
+
+    if not entries:
+        parser.error("No input files found. Pass files or use --input-dir.")
+        return 2
+
+    # Track temps to ensure cleanup on interruption
+    remaining_temps: List[Path] = []
+
+    def _handle_terminate(signum, frame):  # noqa: ARG001
+        try:
+            if not args.keep_project:
+                for td in list(remaining_temps):
+                    shutil.rmtree(td, ignore_errors=True)
+        finally:
+            code = 130 if signum == signal.SIGINT else 143
+            os._exit(code)
+
+    try:
+        signal.signal(signal.SIGINT, _handle_terminate)
+        signal.signal(signal.SIGTERM, _handle_terminate)
+    except Exception:
+        pass
+
+    # Sequential per-entry processing: extract (if needed) -> analyze -> cleanup tmp
+    for entry in entries:
+        temp_dir: Path | None = None
+        try:
+            if zipfile.is_zipfile(entry):
+                collected, temps = _extract_zip_archive(entry, args.zip_password)
+                temp_dir = temps[0] if temps else None
+                if temp_dir:
+                    remaining_temps.append(temp_dir)
+                binaries = [p.resolve() for p in collected if _is_likely_binary(p)]
+                print(f"[i] Extracted {len(binaries)} candidate binaries from {entry.name}")
+            else:
+                resolved = entry.resolve()
+                binaries = [resolved] if _is_likely_binary(resolved) else []
+
+            if not binaries:
+                print(f"[i] Skipping {entry.name}: no valid binaries detected")
+                continue
+
+            try:
+                validated = _validate_binaries(binaries)
+            except FileNotFoundError as exc:
+                print(f"[!] Skipping {entry.name}: {exc}")
+                continue
+
+            run_analysis(
+                binaries=validated,
+                ghidra_install=args.ghidra_install,
+                output_dir=args.output_dir,
+                script_path=args.script,
+                output_format=args.output_format,
+                keep_project=args.keep_project,
+                overwrite=args.overwrite,
+                language_id=args.language_id,
+                entry_address=("ALL" if args.all_functions else args.entry_address),
+            )
+        except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as exc:
+            parser.error(str(exc))
+            return 2
+        finally:
+            if temp_dir and not args.keep_project:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                try:
+                    remaining_temps.remove(temp_dir)
+                except ValueError:
+                    pass
+            # After processing this entry, check that at least one expected
+            # output file was produced; if not, log a warning to help diagnose.
+            try:
+                expected = [
+                    args.output_dir.expanduser().resolve() / (b.name + f".cfg.{args.output_format}")
+                    for b in (validated if 'validated' in locals() else [])
+                ]
+                produced = [p for p in expected if p.exists()]
+                if expected and not produced:
+                    print(f"[!] No outputs produced for entry '{entry.name}'. The binaries may have no discoverable functions or the export failed.")
+            except Exception:
+                # Diagnostics only; ignore any errors here
+                pass
+
     return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

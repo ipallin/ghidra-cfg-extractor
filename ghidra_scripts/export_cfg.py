@@ -190,101 +190,128 @@ def run():
 
     target_function = None
 
-    if entry_address:
-        try:
-            address = toAddr(entry_address)
-        except Exception:  # noqa: BLE001 - ghidra provides non-standard exceptions
-            printerr("Invalid entry address '{}'.".format(entry_address))
-            return
-        target_function = function_manager.getFunctionAt(address)
-        if target_function is None:
-            printerr(
-                "No function found at entry address '{}'. Provide a valid address.".format(
-                    entry_address
+    # If entry_address is the special value "ALL", export all functions.
+    export_all = False
+    if entry_address is not None and entry_address.upper() == "ALL":
+        export_all = True
+        entry_address = None
+
+    if not export_all:
+        if entry_address:
+            try:
+                address = toAddr(entry_address)
+            except Exception:  # noqa: BLE001 - ghidra provides non-standard exceptions
+                printerr("Invalid entry address '{}' .".format(entry_address))
+                return
+            target_function = function_manager.getFunctionAt(address)
+            if target_function is None:
+                printerr(
+                    "No function found at entry address '{}'. Provide a valid address.".format(
+                        entry_address
+                    )
                 )
-            )
-            return
+                return
+        else:
+            function_iter = function_manager.getFunctions(True)
+            while function_iter.hasNext():
+                candidate = function_iter.next()
+                if candidate.getName() == "main":
+                    target_function = candidate
+                    break
+
+            if target_function is None:
+                printerr(
+                    "Function 'main' was not found. Re-run with --entry-address or --all-functions."
+                )
+                return
+
+    if export_all:
+        monitor.setMessage("Exporting CFGs for all functions")
     else:
-        function_iter = function_manager.getFunctions(True)
-        while function_iter.hasNext():
-            candidate = function_iter.next()
-            if candidate.getName() == "main":
-                target_function = candidate
-                break
-
-        if target_function is None:
-            printerr(
-                "Function 'main' was not found. Re-run with --entry-address to specify its location."
-            )
-            return
-
-    monitor.setMessage("Exporting CFG for {}".format(target_function.getName()))
+        monitor.setMessage("Exporting CFG for {}".format(target_function.getName()))
 
     body = target_function.getBody()
     block_iter = block_model.getCodeBlocksContaining(body, monitor)
 
-    blocks = {}
-    block_list = []
-    edges = []
+    def _export_function(fn, functions_out):
+        body = fn.getBody()
+        block_iter = block_model.getCodeBlocksContaining(body, monitor)
 
-    while block_iter.hasNext() and not monitor.isCancelled():
-        block = block_iter.next()
-        start = _as_hex(block.getFirstStartAddress())
-        end = _as_hex(block.getMaxAddress())
-        size = block.getNumAddresses()
+        blocks = {}
+        block_list = []
+        edges = []
 
-        block_info = {
-            "id": start,
-            "start": start,
-            "end": end,
-            "size": int(size),
-        }
+        while block_iter.hasNext() and not monitor.isCancelled():
+            block = block_iter.next()
+            start = _as_hex(block.getFirstStartAddress())
+            end = _as_hex(block.getMaxAddress())
+            size = block.getNumAddresses()
 
-        instructions = []
-        inst_iter = listing.getInstructions(block, True)
-        while inst_iter.hasNext() and not monitor.isCancelled():
-            instruction = inst_iter.next()
-            operands = []
-            for op_index in range(instruction.getNumOperands()):
-                operands.append(instruction.getDefaultOperandRepresentation(op_index))
-            instructions.append(
-                {
-                    "address": _as_hex(instruction.getAddress()),
-                    "mnemonic": instruction.getMnemonicString(),
-                    "operands": operands,
-                    "representation": instruction.toString(),
-                }
-            )
+            block_info = {
+                "id": start,
+                "start": start,
+                "end": end,
+                "size": int(size),
+            }
 
-        block_info["instructions"] = instructions
+            instructions = []
+            inst_iter = listing.getInstructions(block, True)
+            while inst_iter.hasNext() and not monitor.isCancelled():
+                instruction = inst_iter.next()
+                operands = []
+                for op_index in range(instruction.getNumOperands()):
+                    operands.append(instruction.getDefaultOperandRepresentation(op_index))
+                instructions.append(
+                    {
+                        "address": _as_hex(instruction.getAddress()),
+                        "mnemonic": instruction.getMnemonicString(),
+                        "operands": operands,
+                        "representation": instruction.toString(),
+                    }
+                )
 
-        block_list.append(block_info)
-        blocks[start] = block
+            block_info["instructions"] = instructions
 
-    for block_id, block in blocks.items():
-        dest_iter = block.getDestinations(monitor)
-        while dest_iter.hasNext() and not monitor.isCancelled():
-            reference = dest_iter.next()
-            dest_block = reference.getDestinationBlock()
-            if dest_block is None:
-                continue
-            dest_id = _as_hex(dest_block.getFirstStartAddress())
-            edges.append(
-                {
-                    "source": block_id,
-                    "target": dest_id,
-                    "type": str(reference.getFlowType()),
-                }
-            )
+            block_list.append(block_info)
+            blocks[start] = block
 
-    functions.append(
-        {
-            "name": target_function.getName(),
-            "entry_point": _as_hex(target_function.getEntryPoint()),
-            "blocks": block_list,
-            "edges": edges,
-        }
-    )
+        for block_id, block in blocks.items():
+            dest_iter = block.getDestinations(monitor)
+            while dest_iter.hasNext() and not monitor.isCancelled():
+                reference = dest_iter.next()
+                dest_block = reference.getDestinationBlock()
+                if dest_block is None:
+                    continue
+                dest_id = _as_hex(dest_block.getFirstStartAddress())
+                edges.append(
+                    {
+                        "source": block_id,
+                        "target": dest_id,
+                        "type": str(reference.getFlowType()),
+                    }
+                )
+
+        functions_out.append(
+            {
+                "name": fn.getName(),
+                "entry_point": _as_hex(fn.getEntryPoint()),
+                "blocks": block_list,
+                "edges": edges,
+            }
+        )
+
+    if export_all:
+        function_iter = function_manager.getFunctions(True)
+        count = 0
+        while function_iter.hasNext():
+            fn = function_iter.next()
+            _export_function(fn, functions)
+            count += 1
+        if count == 0:
+            # Still write an empty output file to signal processing completed.
+            printerr("No functions discovered to export. Writing empty output.")
+    else:
+        _export_function(target_function, functions)
 
     writers = {
         "json": _write_json,
