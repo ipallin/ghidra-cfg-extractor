@@ -264,6 +264,191 @@ def run_analysis(
                 shutil.rmtree(project_dir, ignore_errors=True)
 
 
+def _is_within_directory(directory: Path, target: Path) -> bool:
+    """Return True if *target* resides inside *directory*."""
+
+    try:
+        target.relative_to(directory)
+        return True
+    except ValueError:
+        return False
+
+
+def _ensure_empty_directory(path: Path) -> None:
+    """Remove all contents from *path* while keeping the directory itself."""
+
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        return
+
+    for child in path.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            try:
+                child.unlink()
+            except FileNotFoundError:
+                # Another process might have removed the file between iteration
+                # and unlink; ignore such race conditions.
+                continue
+
+
+def _safe_extract_zip(zip_path: Path, destination: Path, password: bytes | None = None) -> None:
+    """Extract *zip_path* into *destination* while preventing path traversal."""
+
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        destination = destination.resolve()
+        for info in archive.infolist():
+            member_path = Path(info.filename)
+            if member_path.is_absolute():
+                raise RuntimeError(
+                    f"Archive {zip_path} contains an absolute path entry: {info.filename}"
+                )
+
+            resolved_target = (destination / member_path).resolve()
+            if not _is_within_directory(destination, resolved_target):
+                raise RuntimeError(
+                    f"Archive {zip_path} would extract outside the destination directory"
+                )
+
+        if password is None:
+            archive.extractall(destination)
+        else:
+            archive.extractall(destination, pwd=password)
+
+
+def _extract_zip_archive(entry: Path, zip_passwords: list[str] | None = None) -> Tuple[List[Path], List[Path]]:
+    """Extract *entry* (a ZIP archive) and return collected files and temp dirs."""
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="gh_extract_"))
+    passwords: list[str] = list(zip_passwords or [])
+    if "infected" not in passwords:
+        passwords.append("infected")
+
+    try:
+        try:
+            _ensure_empty_directory(temp_dir)
+            _safe_extract_zip(entry, temp_dir)
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            if "encrypted" not in message and "password" not in message:
+                raise
+
+            extracted = False
+            for pw in passwords:
+                _ensure_empty_directory(temp_dir)
+                try:
+                    print(
+                        f"[i] Archive appears encrypted; trying password '{pw}' with stdlib for {entry}"
+                    )
+                    _safe_extract_zip(entry, temp_dir, password=pw.encode())
+                    extracted = True
+                    break
+                except RuntimeError:
+                    continue
+
+            if not extracted:
+                # Try p7zip (7z/7za/7zr) which supports AES-encrypted zips.
+                for sevenz_cmd in ("7z", "7za", "7zr"):
+                    sevenz_bin = shutil.which(sevenz_cmd)
+                    if not sevenz_bin:
+                        continue
+
+                    for pw in passwords:
+                        _ensure_empty_directory(temp_dir)
+                        print(
+                            f"[i] attempting '{sevenz_cmd}' with password '{pw}' for {entry}"
+                        )
+                        cmd = [
+                            sevenz_bin,
+                            "x",
+                            f"-p{pw}",
+                            "-y",
+                            f"-o{str(temp_dir)}",
+                            str(entry),
+                        ]
+                        res = subprocess.run(
+                            cmd,
+                            check=False,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                        )
+                        if res.returncode == 0:
+                            extracted = True
+                            break
+                        else:
+                            print(
+                                f"[!] {sevenz_cmd} failed for {entry}: {res.stderr.strip()}"
+                            )
+                    if extracted:
+                        break
+
+                if not extracted:
+                    unzip_bin = shutil.which("unzip")
+                    if unzip_bin:
+                        for pw in passwords:
+                            _ensure_empty_directory(temp_dir)
+                            print(
+                                "[i] p7zip/unzip attempt failed; attempting system 'unzip' "
+                                f"with password '{pw}' for {entry}"
+                            )
+                            res = subprocess.run(
+                                [
+                                    unzip_bin,
+                                    "-P",
+                                    pw,
+                                    "-o",
+                                    str(entry),
+                                    "-d",
+                                    str(temp_dir),
+                                ],
+                                check=False,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True,
+                            )
+                            if res.returncode == 0:
+                                extracted = True
+                                break
+                            else:
+                                print(
+                                    f"[!] system unzip failed for {entry}: {res.stderr.strip()}"
+                                )
+
+                if not extracted:
+                    raise RuntimeError(
+                        "could not extract encrypted archive with available passwords/tools"
+                    )
+
+        collected = [p for p in temp_dir.rglob("*") if p.is_file()]
+        return collected, [temp_dir]
+    except zipfile.BadZipFile:
+        print(f"[!] Skipping invalid zip archive: {entry}")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return [], []
+    except Exception:
+        print(f"[!] Skipping archive due to extraction failure: {entry}")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return [], []
+
+
+def _collect_from_path(path: Path, zip_passwords: list[str] | None = None) -> Tuple[List[Path], List[Path]]:
+    """Collect binaries from *path* which may be a file or directory."""
+
+    path = path.expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Input path not found: {path}")
+
+    if path.is_dir():
+        return _gather_from_input_dir(path, zip_passwords)
+
+    if zipfile.is_zipfile(path):
+        return _extract_zip_archive(path, zip_passwords)
+
+    return [path], []
+
+
 def _gather_from_input_dir(input_dir: Path, zip_passwords: list[str] | None = None) -> Tuple[List[Path], List[Path]]:
     """Collect binaries from `input_dir`.
 
@@ -284,97 +469,10 @@ def _gather_from_input_dir(input_dir: Path, zip_passwords: list[str] | None = No
             # files directly in the input directory.
             continue
 
-        if entry.suffix.lower() == ".zip":
-            td = Path(tempfile.mkdtemp(prefix="gh_extract_"))
-            try:
-                with zipfile.ZipFile(entry, "r") as zf:
-                    try:
-                        zf.extractall(td)
-                    except RuntimeError as re:
-                        # zipfile raises RuntimeError when files are encrypted
-                        # and no password was provided.
-                        msg = str(re).lower()
-                        if "encrypted" in msg or "password" in msg:
-                            # Build ordered list of passwords to try: user-provided first, then default
-                            passwords: list[str] = list(zip_passwords or [])
-                            if "infected" not in passwords:
-                                passwords.append("infected")
-
-                            extracted = False
-                            # Try stdlib with each password
-                            for pw in passwords:
-                                try:
-                                    print(f"[i] Archive appears encrypted; trying password '{pw}' with stdlib for {entry}")
-                                    zf.extractall(td, pwd=pw.encode())
-                                    extracted = True
-                                    break
-                                except RuntimeError:
-                                    continue
-
-                            if not extracted:
-                                # Prefer p7zip (7z/7za/7zr) which supports AES-encrypted zips
-                                for sevenz_cmd in ("7z", "7za", "7zr"):
-                                    sevenz_bin = shutil.which(sevenz_cmd)
-                                    if not sevenz_bin:
-                                        continue
-                                    for pw in passwords:
-                                        print(f"[i] attempting '{sevenz_cmd}' with password '{pw}' for {entry}")
-                                        # 7z x -pPASSWORD -y -oDEST ARCHIVE
-                                        cmd = [sevenz_bin, "x", f"-p{pw}", "-y", f"-o{str(td)}", str(entry)]
-                                        res = subprocess.run(
-                                            cmd,
-                                            check=False,
-                                            stdout=subprocess.PIPE,
-                                            stderr=subprocess.PIPE,
-                                            text=True,
-                                        )
-                                        if res.returncode == 0:
-                                            extracted = True
-                                            break
-                                        else:
-                                            print(f"[!] {sevenz_cmd} failed for {entry}: {res.stderr.strip()}")
-                                    if extracted:
-                                        break
-
-                                # If p7zip couldn't handle it, try system unzip (may not support newer PK compat/encryption)
-                                if not extracted:
-                                    unzip_bin = shutil.which("unzip")
-                                    if unzip_bin:
-                                        for pw in passwords:
-                                            print(f"[i] p7zip/unzip attempt failed; attempting system 'unzip' with password '{pw}' for {entry}")
-                                            res = subprocess.run(
-                                                [unzip_bin, "-P", pw, "-o", str(entry), "-d", str(td)],
-                                                check=False,
-                                                stdout=subprocess.PIPE,
-                                                stderr=subprocess.PIPE,
-                                                text=True,
-                                            )
-                                            if res.returncode == 0:
-                                                extracted = True
-                                                break
-                                            else:
-                                                print(f"[!] system unzip failed for {entry}: {res.stderr.strip()}")
-
-                            if not extracted:
-                                raise RuntimeError("could not extract encrypted archive with available passwords/tools")
-                        else:
-                            raise
-            except zipfile.BadZipFile:
-                print(f"[!] Skipping invalid zip archive: {entry}")
-                shutil.rmtree(td, ignore_errors=True)
-                continue
-            except Exception:
-                # Any failure extracting (bad zip, wrong password, missing unzip, etc.) -> skip archive
-                print(f"[!] Skipping archive due to extraction failure: {entry}")
-                shutil.rmtree(td, ignore_errors=True)
-                continue
-
-            # collect all files extracted
-            for p in td.rglob("*"):
-                if p.is_file():
-                    collected.append(p)
-
-            temp_dirs.append(td)
+        if zipfile.is_zipfile(entry):
+            files, temps = _extract_zip_archive(entry, zip_passwords)
+            collected.extend(files)
+            temp_dirs.extend(temps)
         else:
             collected.append(entry.resolve())
 
@@ -392,16 +490,28 @@ def main(argv: Iterable[str] | None = None) -> int:
     # Gather binaries either from positional args, or from --input-dir, or both.
     if args.input_dir:
         try:
-            gathered, temp_dirs = _gather_from_input_dir(args.input_dir, args.zip_password)
+            gathered, gathered_temp_dirs = _gather_from_input_dir(
+                args.input_dir, args.zip_password
+            )
         except FileNotFoundError as exc:
             parser.error(str(exc))
             return 2
 
-        # extend with any explicitly provided positional binaries
+        temp_dirs.extend(gathered_temp_dirs)
         binaries_to_process.extend(gathered)
 
     if args.binaries:
-        binaries_to_process.extend(args.binaries)
+        for provided in args.binaries:
+            try:
+                collected, collected_temp_dirs = _collect_from_path(
+                    provided, args.zip_password
+                )
+            except FileNotFoundError as exc:
+                parser.error(str(exc))
+                return 2
+
+            temp_dirs.extend(collected_temp_dirs)
+            binaries_to_process.extend(collected)
 
     if not binaries_to_process:
         parser.error("No binaries provided. Pass paths or use --input-dir.")
