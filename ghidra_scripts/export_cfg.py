@@ -154,6 +154,99 @@ def _write_graphml(program_info, functions, output_path):
     return True
 
 
+def _write_gexf(program_info, functions, output_path):
+    try:
+        import xml.etree.ElementTree as ET
+    except ImportError:
+        printerr("xml.etree.ElementTree is unavailable; cannot export GEXF")
+        return False
+
+    NS_GEXF = "http://www.gexf.net/1.2draft"
+    NS_XSI = "http://www.w3.org/2001/XMLSchema-instance"
+
+    gexf = ET.Element(
+        "gexf",
+        {
+            "xmlns": NS_GEXF,
+            "xmlns:xsi": NS_XSI,
+            "version": "1.2",
+            "xsi:schemaLocation": "%s %s/gexf.xsd" % (NS_GEXF, NS_GEXF),
+        },
+    )
+
+    meta = ET.SubElement(gexf, "meta")
+    creator = ET.SubElement(meta, "creator")
+    creator.text = "ghidra-cfg-extractor"
+    description = ET.SubElement(meta, "description")
+    desc_program = program_info.get("name") or ""
+    desc_lang = program_info.get("language_id") or ""
+    desc_comp = program_info.get("compiler") or ""
+    description.text = "program=%s; language=%s; compiler=%s" % (desc_program, desc_lang, desc_comp)
+
+    graph = ET.SubElement(
+        gexf,
+        "graph",
+        {
+            "defaultedgetype": "directed",
+            "mode": "static",
+        },
+    )
+
+    # Define attributes for nodes and edges
+    node_attrs = ET.SubElement(graph, "attributes", {"class": "node"})
+    ET.SubElement(node_attrs, "attribute", {"id": "0", "title": "function", "type": "string"})
+    ET.SubElement(node_attrs, "attribute", {"id": "1", "title": "start", "type": "string"})
+    ET.SubElement(node_attrs, "attribute", {"id": "2", "title": "end", "type": "string"})
+    ET.SubElement(node_attrs, "attribute", {"id": "3", "title": "size", "type": "integer"})
+    ET.SubElement(node_attrs, "attribute", {"id": "4", "title": "instructions", "type": "string"})
+
+    edge_attrs = ET.SubElement(graph, "attributes", {"class": "edge"})
+    ET.SubElement(edge_attrs, "attribute", {"id": "0", "title": "flow_type", "type": "string"})
+
+    nodes_el = ET.SubElement(graph, "nodes")
+    edges_el = ET.SubElement(graph, "edges")
+
+    # Build nodes and edges. Node ids must be unique across the entire graph.
+    for function in functions:
+        function_name = function.get("name") or "function"
+        entry_point = function.get("entry_point") or "unknown"
+        node_prefix = (function_name + "@" + entry_point).replace(" ", "_")
+
+        for block in function.get("blocks", []):
+            block_id = block.get("id") or "block"
+            node_id = "%s::%s" % (node_prefix, block_id)
+            node_el = ET.SubElement(nodes_el, "node", {"id": node_id, "label": function_name})
+            attvalues = ET.SubElement(node_el, "attvalues")
+            # function
+            ET.SubElement(attvalues, "attvalue", {"for": "0", "value": function_name})
+            # start
+            ET.SubElement(attvalues, "attvalue", {"for": "1", "value": block.get("start") or ""})
+            # end
+            ET.SubElement(attvalues, "attvalue", {"for": "2", "value": block.get("end") or ""})
+            # size
+            ET.SubElement(attvalues, "attvalue", {"for": "3", "value": str(block.get("size"))})
+            # instructions (joined string)
+            instructions = block.get("instructions", [])
+            if instructions:
+                instr_text = "\n".join(instr.get("representation") or "" for instr in instructions)
+                ET.SubElement(attvalues, "attvalue", {"for": "4", "value": instr_text})
+
+        edge_index = 0
+        for edge in function.get("edges", []):
+            src = "%s::%s" % (node_prefix, (edge.get('source') or ""))
+            tgt = "%s::%s" % (node_prefix, (edge.get('target') or ""))
+            eid = "%s::e%d" % (node_prefix, edge_index)
+            edge_index += 1
+            edge_el = ET.SubElement(edges_el, "edge", {"id": eid, "source": src, "target": tgt})
+            attvalues_e = ET.SubElement(edge_el, "attvalues")
+            ET.SubElement(attvalues_e, "attvalue", {"for": "0", "value": edge.get("type") or ""})
+
+    _ensure_parent(output_path)
+    tree = ET.ElementTree(gexf)
+    tree.write(output_path, encoding="utf-8", xml_declaration=True)
+    return True
+
+
 def run():
     args = getScriptArgs()
     if not args:
@@ -313,6 +406,7 @@ def run():
     writers = {
         "json": _write_json,
         "graphml": _write_graphml,
+        "gexf": _write_gexf,
     }
 
     writer = writers.get(output_format)

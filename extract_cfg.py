@@ -191,7 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--format",
         dest="output_format",
-        choices=("json", "graphml"),
+        choices=("json", "graphml", "gexf"),
         default="graphml",
         help="Format of the exported control-flow graphs. Defaults to graphml.",
     )
