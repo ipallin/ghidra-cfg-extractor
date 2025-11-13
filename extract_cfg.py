@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterable, List
 import zipfile
 from typing import Tuple
+import concurrent.futures
 
 
 # Require Python 3.10+ because the code uses the PEP 604 union syntax (e.g. "Path | None").
@@ -196,6 +197,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Format of the exported control-flow graphs. Defaults to graphml.",
     )
     parser.add_argument(
+        "--workers",
+        dest="workers",
+        type=int,
+        default=(os.cpu_count() or 1),
+        help=(
+            "Number of concurrent analyses to run. Defaults to the number of CPU "
+            "cores available. Set to 1 to run sequentially."
+        ),
+    )
+    parser.add_argument(
         "--entry-address",
         dest="entry_address",
         help=(
@@ -301,37 +312,70 @@ def run_analysis(
 
     for binary in binaries:
         project_dir = Path(tempfile.mkdtemp(prefix="ghidra_cfg_"))
-        project_name = binary.stem
-        output_path = output_dir / (binary.name + ".cfg." + output_format)
-
-        command = _build_analyze_command(
-            analyze_headless=analyze_headless,
-            project_dir=project_dir,
-            project_name=project_name,
+    for binary in binaries:
+        _analyze_single(
             binary=binary,
+            analyze_headless=analyze_headless,
             script_path=script_path,
-            output_path=output_path,
+            output_dir=output_dir,
             output_format=output_format,
+            keep_project=keep_project,
+            overwrite=overwrite,
             language_id=language_id,
             entry_address=entry_address,
         )
 
-        print("[+] Running:", " ".join(command))
-        try:
-            subprocess.run(command, check=True)
-            if output_path.exists():
-                print(f"[+] CFG exported to {output_path}")
-            else:
-                print(
-                    f"[!] No output produced for {binary}. The program may not have a 'main' function or export failed."
-                )
-        finally:
-            if keep_project:
-                print(f"[!] Preserving temporary project at {project_dir}")
-            else:
-                shutil.rmtree(project_dir, ignore_errors=True)
 
+def _analyze_single(
+    binary: Path,
+    analyze_headless: Path,
+    script_path: Path,
+    output_dir: Path,
+    output_format: str,
+    keep_project: bool = False,
+    overwrite: bool = False,
+    language_id: str | None = None,
+    entry_address: str | None = None,
+) -> None:
+    """Analyze a single binary by invoking analyzeHeadless and manage the temp project dir.
 
+    This helper is safe to call concurrently from multiple threads.
+    """
+    project_dir = Path(tempfile.mkdtemp(prefix="ghidra_cfg_"))
+    project_name = binary.stem
+    output_path = output_dir / (binary.name + ".cfg." + output_format)
+
+    if output_path.exists() and not overwrite:
+        raise FileExistsError(
+            f"Output file {output_path} already exists. Use --overwrite to replace it."
+        )
+
+    command = _build_analyze_command(
+        analyze_headless=analyze_headless,
+        project_dir=project_dir,
+        project_name=project_name,
+        binary=binary,
+        script_path=script_path,
+        output_path=output_path,
+        output_format=output_format,
+        language_id=language_id,
+        entry_address=entry_address,
+    )
+
+    print("[+] Running:", " ".join(command))
+    try:
+        subprocess.run(command, check=True)
+        if output_path.exists():
+            print(f"[+] CFG exported to {output_path}")
+        else:
+            print(
+                f"[!] No output produced for {binary}. The program may not have a 'main' function or export failed."
+            )
+    finally:
+        if keep_project:
+            print(f"[!] Preserving temporary project at {project_dir}")
+        else:
+            shutil.rmtree(project_dir, ignore_errors=True)
 def _is_within_directory(directory: Path, target: Path) -> bool:
     """Return True if *target* resides inside *directory*."""
 
@@ -605,7 +649,35 @@ def main(argv: Iterable[str] | None = None) -> int:
     except Exception:
         pass
 
-    # Sequential per-entry processing: extract (if needed) -> analyze -> cleanup tmp
+    # Validate Ghidra installation and script once up-front so worker tasks don't
+    # need to repeat the same checks.
+    try:
+        if not args.ghidra_install:
+            raise ValueError(
+                "The path to the Ghidra installation is required. Use --ghidra-install or set GHIDRA_INSTALL_DIR."
+            )
+        ghidra_install = args.ghidra_install.expanduser().resolve()
+        if not ghidra_install.exists():
+            parser.error(f"Ghidra installation not found at {ghidra_install}")
+            return 2
+        analyze_headless = _resolve_headless_executable(ghidra_install)
+
+        script_path = args.script.expanduser().resolve()
+        if not script_path.exists():
+            parser.error(f"Ghidra script not found at {script_path}")
+            return 2
+
+        output_dir = args.output_dir.expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except (ValueError, FileNotFoundError) as exc:
+        parser.error(str(exc))
+        return 2
+
+    # Create a worker pool to analyze binaries concurrently.
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
+    futures: list[concurrent.futures.Future] = []
+
+    # Per-entry processing: extract (if needed) -> validate -> submit analyze task(s)
     for entry in entries:
         temp_dir: Path | None = None
         try:
@@ -630,17 +702,23 @@ def main(argv: Iterable[str] | None = None) -> int:
                 print(f"[!] Skipping {entry.name}: {exc}")
                 continue
 
-            run_analysis(
-                binaries=validated,
-                ghidra_install=args.ghidra_install,
-                output_dir=args.output_dir,
-                script_path=args.script,
-                output_format=args.output_format,
-                keep_project=args.keep_project,
-                overwrite=args.overwrite,
-                language_id=args.language_id,
-                entry_address=("ALL" if args.all_functions else args.entry_address),
-            )
+            # Submit one task per validated binary. The helper will create its own
+            # temporary project directory and clean it up when done (unless
+            # --keep-project was passed).
+            for vb in validated:
+                fut = executor.submit(
+                    _analyze_single,
+                    vb,
+                    analyze_headless,
+                    script_path,
+                    output_dir,
+                    args.output_format,
+                    args.keep_project,
+                    args.overwrite,
+                    args.language_id,
+                    ("ALL" if args.all_functions else args.entry_address),
+                )
+                futures.append((entry, vb, fut))
         except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as exc:
             parser.error(str(exc))
             return 2
@@ -664,6 +742,18 @@ def main(argv: Iterable[str] | None = None) -> int:
             except Exception:
                 # Diagnostics only; ignore any errors here
                 pass
+
+    # Wait for all submitted tasks to finish and handle errors.
+    executor.shutdown(wait=True)
+    for entry, vb, fut in futures:
+        try:
+            fut.result()
+        except subprocess.CalledProcessError as cpe:
+            parser.error(f"Analysis failed for {vb}: {cpe}")
+            return 2
+        except Exception as exc:
+            parser.error(str(exc))
+            return 2
 
     return 0
 
