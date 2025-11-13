@@ -558,80 +558,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             print(f"[i] Auto-detected Ghidra installation at {auto}")
             args.ghidra_install = auto
 
-    # Build a list of processing units where each unit corresponds to a single
-    # input file. If the input file is a ZIP archive it will be extracted into
-    # a temporary directory and the unit will reference that temp dir; after
-    # the unit is processed the temp dir will be removed (unless
-    # --keep-project is set). This implements "per-file" processing.
-    processing_units: List[Tuple[Path | None, List[Path]]] = []
-
-    # Track all temporary dirs created while extracting archives so we can
-    # clean them up if validation fails or an early error occurs.
-    all_temp_dirs: List[Path] = []
-
-    # Inputs from --input-dir
-    if args.input_dir:
-        input_dir = args.input_dir.expanduser().resolve()
-        if not input_dir.exists() or not input_dir.is_dir():
-            parser.error(f"Input directory not found: {input_dir}")
-            return 2
-
-        for entry in input_dir.iterdir():
-            if not entry.is_file():
-                continue
-
-            if zipfile.is_zipfile(entry):
-                collected, temps = _extract_zip_archive(entry, args.zip_password)
-                # remember any temp dirs created for cleanup on failure
-                all_temp_dirs.extend(temps)
-                # filter only likely binaries from the extracted files
-                filtered = [p for p in collected if _is_likely_binary(p)]
-                temp_dir = temps[0] if temps else None
-                processing_units.append((temp_dir, filtered))
-            else:
-                resolved = entry.resolve()
-                files = [resolved] if _is_likely_binary(resolved) else []
-                processing_units.append((None, files))
-
-    # Inputs from positional args
-    if args.binaries:
-        for provided in args.binaries:
-            try:
-                collected, collected_temp_dirs = _collect_from_path(
-                    provided, args.zip_password
-                )
-            except FileNotFoundError as exc:
-                parser.error(str(exc))
-                return 2
-
-            # remember any temp dirs created when collecting this path
-            all_temp_dirs.extend(collected_temp_dirs)
-            # filter only likely binaries
-            filtered = [p for p in collected if _is_likely_binary(p)]
-            temp_dir = collected_temp_dirs[0] if collected_temp_dirs else None
-            processing_units.append((temp_dir, filtered))
-
-    # Ensure there's something to do
-    if not processing_units:
-        parser.error("No binaries provided. Pass paths or use --input-dir.")
-        return 2
-
-    # Validate all collected binaries (flatten list)
-    all_binaries = [p for _, plist in processing_units for p in plist]
-    try:
-        validated = _validate_binaries(all_binaries)
-    except FileNotFoundError as exc:
-        # validation failed; clean up any extracted temp dirs before exiting
-        if all_temp_dirs and not args.keep_project:
-            for td in all_temp_dirs:
-                shutil.rmtree(td, ignore_errors=True)
-
-        parser.error(str(exc))
-        return 2
-
-    validated_set = set(validated)
-
-    # Process each unit independently: run analysis on the unit's binaries,
+    # Process per-entry without pre-extracting the entire input set.
     # Build a list of input entries (files only) without extracting upfront.
     entries: List[Path] = []
     if args.input_dir:
@@ -739,3 +666,6 @@ def main(argv: Iterable[str] | None = None) -> int:
                 pass
 
     return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

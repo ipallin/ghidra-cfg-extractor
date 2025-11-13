@@ -230,9 +230,6 @@ def run():
     else:
         monitor.setMessage("Exporting CFG for {}".format(target_function.getName()))
 
-    body = target_function.getBody()
-    block_iter = block_model.getCodeBlocksContaining(body, monitor)
-
     def _export_function(fn, functions_out):
         body = fn.getBody()
         block_iter = block_model.getCodeBlocksContaining(body, monitor)
