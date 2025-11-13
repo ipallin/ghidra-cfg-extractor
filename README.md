@@ -8,7 +8,7 @@ utilizando Ghidra en modo *headless*.
 - [Ghidra](https://ghidra-sre.org/) instalado localmente. Puedes indicar la
   ubicación mediante la variable de entorno `GHIDRA_INSTALL_DIR` o con el
   argumento `--ghidra-install` del script.
-- Python 3.9 o superior para ejecutar el script `extract_cfg.py`.
+- Python 3.10 o superior para ejecutar el script `extract_cfg.py`.
 
 ## Uso
 
