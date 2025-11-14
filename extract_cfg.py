@@ -220,7 +220,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--workers",
         dest="workers",
         type=int,
-        default=(os.cpu_count() or 1),
+        default=1,
         help=(
             "Number of concurrent analyses to run. Defaults to the number of CPU "
             "cores available. Set to 1 to run sequentially."
@@ -817,6 +817,32 @@ def main(argv: Iterable[str] | None = None) -> int:
                 if a not in combined:
                     combined.append(a)
         args.jvm_arg = combined
+
+    # If running sequentially (default) and the user didn't provide JVM args and
+    # didn't request auto-tune, allocate most resources to the single Ghidra
+    # instance so it can use all available CPUs and a large heap.
+    if not args.auto_tune and args.workers == 1 and not args.jvm_arg:
+        cpu = os.cpu_count() or 1
+        mem_mb = _get_mem_available_mb()
+        # Reserve 1 GB for the OS if possible
+        reserve_mb = 1024
+        if mem_mb and mem_mb > reserve_mb + 256:
+            heap_mb = max(256, mem_mb - reserve_mb)
+        elif mem_mb:
+            heap_mb = max(128, mem_mb - 128)
+        else:
+            heap_mb = 2048
+
+        if heap_mb >= 1024:
+            xmx = f"{heap_mb // 1024}G"
+        else:
+            xmx = f"{heap_mb}M"
+
+        apc = max(1, cpu)
+        pgt = max(1, apc // 2)
+        default_jvm = [f"-Xmx{xmx}", f"-XX:ActiveProcessorCount={apc}", f"-XX:ParallelGCThreads={pgt}"]
+        args.jvm_arg = default_jvm
+        print(f"[i] Default single-worker JVM args applied: {args.jvm_arg}")
 
     # Create a worker pool to analyze binaries concurrently.
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
