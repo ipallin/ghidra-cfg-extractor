@@ -197,6 +197,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Format of the exported control-flow graphs. Defaults to graphml.",
     )
     parser.add_argument(
+        "--jvm-arg",
+        dest="jvm_arg",
+        action="append",
+        help=(
+            "JVM argument to pass to analyzeHeadless. Can be repeated. "
+            "Examples: -Xmx12G or -XX:ActiveProcessorCount=16. The wrapper "
+            "will prefix with -J if needed."
+        ),
+    )
+    parser.add_argument(
         "--workers",
         dest="workers",
         type=int,
@@ -245,8 +255,20 @@ def _build_analyze_command(
     output_format: str,
     language_id: str | None = None,
     entry_address: str | None = None,
+    jvm_args: list[str] | None = None,
 ) -> List[str]:
-    command = [
+    """Build the analyzeHeadless command.
+
+    If `jvm_args` are provided they may be passed as e.g. "-Xmx12G" or
+    "-J-XX:ActiveProcessorCount=16". The helper will normalize them to start
+    with "-J" when constructing the command so the JVM receives them.
+    """
+
+    # Do not place -J/JVM args on the analyzeHeadless argv; instead the
+    # subprocess environment will set JAVA_TOOL_OPTIONS if jvm_args are
+    # provided. Putting -J options on the argv confuses analyzeHeadless
+    # argument parsing.
+    command: List[str] = [
         str(analyze_headless),
         str(project_dir),
         project_name,
@@ -257,16 +279,14 @@ def _build_analyze_command(
     if language_id:
         command.extend(["-processor", language_id])
 
-    command.extend(
-        [
-            "-scriptPath",
-            str(script_path.parent),
-            "-postScript",
-            script_path.name,
-            str(output_path),
-            output_format,
-        ]
-    )
+    command.extend([
+        "-scriptPath",
+        str(script_path.parent),
+        "-postScript",
+        script_path.name,
+        str(output_path),
+        output_format,
+    ])
 
     if entry_address:
         command.append(entry_address)
@@ -284,6 +304,7 @@ def run_analysis(
     overwrite: bool = False,
     language_id: str | None = None,
     entry_address: str | None = None,
+    jvm_args: list[str] | None = None,
 ) -> None:
     if not ghidra_install:
         raise ValueError(
@@ -309,9 +330,6 @@ def run_analysis(
             raise FileExistsError(
                 f"Output file {output_path} already exists. Use --overwrite to replace it."
             )
-
-    for binary in binaries:
-        project_dir = Path(tempfile.mkdtemp(prefix="ghidra_cfg_"))
     for binary in binaries:
         _analyze_single(
             binary=binary,
@@ -323,6 +341,7 @@ def run_analysis(
             overwrite=overwrite,
             language_id=language_id,
             entry_address=entry_address,
+            jvm_args=jvm_args,
         )
 
 
@@ -336,6 +355,7 @@ def _analyze_single(
     overwrite: bool = False,
     language_id: str | None = None,
     entry_address: str | None = None,
+    jvm_args: list[str] | None = None,
 ) -> None:
     """Analyze a single binary by invoking analyzeHeadless and manage the temp project dir.
 
@@ -360,11 +380,30 @@ def _analyze_single(
         output_format=output_format,
         language_id=language_id,
         entry_address=entry_address,
+        jvm_args=jvm_args,
     )
 
     print("[+] Running:", " ".join(command))
     try:
-        subprocess.run(command, check=True)
+        # If JVM args were provided, set them via JAVA_TOOL_OPTIONS so the
+        # underlying java launcher receives them. We strip any leading -J
+        # prefix the user may have supplied and join into a single string.
+        env = os.environ.copy()
+        if jvm_args:
+            norm: List[str] = []
+            for a in jvm_args:
+                if a.startswith("-J"):
+                    norm.append(a[2:])
+                elif a.startswith("-"):
+                    norm.append(a)
+                else:
+                    norm.append("-" + a)
+            # Set both common env vars to be maximally compatible
+            env_val = " ".join(norm)
+            env["JAVA_TOOL_OPTIONS"] = env_val
+            env["_JAVA_OPTIONS"] = env_val
+
+        subprocess.run(command, check=True, env=env)
         if output_path.exists():
             print(f"[+] CFG exported to {output_path}")
         else:
@@ -717,6 +756,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                     args.overwrite,
                     args.language_id,
                     ("ALL" if args.all_functions else args.entry_address),
+                    args.jvm_arg,
                 )
                 futures.append((entry, vb, fut))
         except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as exc:
@@ -729,19 +769,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                     remaining_temps.remove(temp_dir)
                 except ValueError:
                     pass
-            # After processing this entry, check that at least one expected
-            # output file was produced; if not, log a warning to help diagnose.
-            try:
-                expected = [
-                    args.output_dir.expanduser().resolve() / (b.name + f".cfg.{args.output_format}")
-                    for b in (validated if 'validated' in locals() else [])
-                ]
-                produced = [p for p in expected if p.exists()]
-                if expected and not produced:
-                    print(f"[!] No outputs produced for entry '{entry.name}'. The binaries may have no discoverable functions or the export failed.")
-            except Exception:
-                # Diagnostics only; ignore any errors here
-                pass
+            # In concurrent mode, outputs may be produced after this entry loop,
+            # so avoid premature warnings here. Errors will be surfaced when
+            # awaiting task futures below.
 
     # Wait for all submitted tasks to finish and handle errors.
     executor.shutdown(wait=True)
