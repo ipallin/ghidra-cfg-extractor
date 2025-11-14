@@ -207,6 +207,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--auto-tune",
+        dest="auto_tune",
+        action="store_true",
+        help=(
+            "Automatically choose --workers and JVM heap/threads based on system resources. "
+            "When enabled the script will compute a safe per-instance -Xmx, set ActiveProcessorCount "
+            "and ParallelGCThreads, and adjust --workers to avoid OOM."
+        ),
+    )
+    parser.add_argument(
         "--workers",
         dest="workers",
         type=int,
@@ -423,6 +433,88 @@ def _is_within_directory(directory: Path, target: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _get_mem_available_mb() -> int:
+    """Return available memory in MB using /proc/meminfo when possible.
+
+    Falls back to 0 if it cannot determine.
+    """
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    # value in kB
+                    kb = int(parts[1])
+                    return kb // 1024
+            # If MemAvailable not present, try MemFree+Buffers+Cached
+            f.seek(0)
+            mem = {}
+            for line in f:
+                k = line.split()[0].rstrip(":")
+                v = int(line.split()[1])
+                mem[k] = v
+            kb = mem.get("MemFree", 0) + mem.get("Buffers", 0) + mem.get("Cached", 0)
+            return kb // 1024
+    except Exception:
+        return 0
+
+
+def _auto_tune_settings(requested_workers: int | None = None) -> tuple[int, list[str]]:
+    """Compute (workers, jvm_args) based on system CPU count and available memory.
+
+    Heuristic:
+      - Reserve a small amount of RAM for the OS (min 1 GB or 10% of available).
+      - Target minimum heap per instance = 2048 MB.
+      - Determine workers = min(cpu_count, floor((mem_available - reserve) / min_heap))
+      - If requested_workers explicitly provided (and >0), cap to that value.
+      - Compute per-instance Xmx = floor((mem_available - reserve) / workers)
+      - Compute ActiveProcessorCount = max(1, floor(cpu_count / workers))
+      - Set ParallelGCThreads = max(1, floor(ActiveProcessorCount/2)).
+    """
+    cpu = os.cpu_count() or 1
+    mem_mb = _get_mem_available_mb()
+
+    # Reserve at least 1024 MB or 10% of memory, whichever is larger
+    reserve_mb = max(1024, int(mem_mb * 0.1)) if mem_mb > 0 else 1024
+
+    min_heap_mb = 2048
+
+    # If memory unknown fallback to conservative defaults
+    if mem_mb <= 0:
+        workers = min(cpu, requested_workers or cpu)
+        jvm_args = [f"-Xmx{min(8, max(1, cpu))}G", f"-XX:ActiveProcessorCount={max(1, cpu//workers)}"]
+        return workers, jvm_args
+
+    usable_mb = max(0, mem_mb - reserve_mb)
+    # maximum workers limited by CPU and memory
+    max_by_mem = usable_mb // min_heap_mb if min_heap_mb > 0 else cpu
+    max_workers = max(1, min(cpu, max(1, max_by_mem)))
+
+    workers = max_workers
+    if requested_workers and requested_workers > 0:
+        workers = min(requested_workers, max_workers)
+
+    # Ensure at least 1 worker
+    workers = max(1, workers)
+
+    # per-instance heap (MB)
+    per_instance_mb = max(256, usable_mb // workers) if usable_mb > 0 else min_heap_mb
+
+    # Convert to G suffix when appropriate
+    if per_instance_mb >= 1024:
+        xmx_val = f"{per_instance_mb // 1024}G"
+    else:
+        xmx_val = f"{per_instance_mb}M"
+
+    # Compute CPU allocation per instance
+    apc = max(1, cpu // workers)
+    pgt = max(1, apc // 2)
+
+    jvm_args: list[str] = [f"-Xmx{xmx_val}", f"-XX:ActiveProcessorCount={apc}", f"-XX:ParallelGCThreads={pgt}"]
+
+    return workers, jvm_args
 
 
 def _ensure_empty_directory(path: Path) -> None:
@@ -711,6 +803,20 @@ def main(argv: Iterable[str] | None = None) -> int:
     except (ValueError, FileNotFoundError) as exc:
         parser.error(str(exc))
         return 2
+
+    # Auto-tune workers and JVM args if requested.
+    if args.auto_tune:
+        requested = args.workers if hasattr(args, "workers") else None
+        tuned_workers, tuned_jvm = _auto_tune_settings(requested_workers=requested)
+        print(f"[i] Auto-tune: selected workers={tuned_workers}, jvm_args={tuned_jvm}")
+        args.workers = tuned_workers
+        # Merge tuned JVM args with any user-provided args, giving user args priority
+        combined: list[str] = list(tuned_jvm)
+        if args.jvm_arg:
+            for a in args.jvm_arg:
+                if a not in combined:
+                    combined.append(a)
+        args.jvm_arg = combined
 
     # Create a worker pool to analyze binaries concurrently.
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
