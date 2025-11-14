@@ -221,6 +221,16 @@ def build_parser() -> argparse.ArgumentParser:
             "will still be attempted if no password succeeds."
         ),
     )
+    parser.add_argument(
+        "--timeout",
+        dest="timeout",
+        type=int,
+        default=0,
+        help=(
+            "Optional per-binary timeout in seconds for the Ghidra headless analysis. "
+            "If set to 0 (default), no timeout is applied."
+        ),
+    )
     return parser
 
 
@@ -273,6 +283,7 @@ def run_analysis(
     overwrite: bool = False,
     language_id: str | None = None,
     entry_address: str | None = None,
+    timeout: int | None = None,
 ) -> None:
     if not ghidra_install:
         raise ValueError(
@@ -299,6 +310,8 @@ def run_analysis(
                 f"Output file {output_path} already exists. Use --overwrite to replace it."
             )
 
+    fails_file = output_dir / "fails.txt"
+
     for binary in binaries:
         project_dir = Path(tempfile.mkdtemp(prefix="ghidra_cfg_"))
         project_name = binary.stem
@@ -318,13 +331,31 @@ def run_analysis(
 
         print("[+] Running:", " ".join(command))
         try:
-            subprocess.run(command, check=True)
+            kwargs: dict = {"check": True}
+            if timeout and timeout > 0:
+                kwargs["timeout"] = timeout
+
+            subprocess.run(command, **kwargs)
             if output_path.exists():
                 print(f"[+] CFG exported to {output_path}")
             else:
                 print(
                     f"[!] No output produced for {binary}. The program may not have a 'main' function or export failed."
                 )
+                with open(fails_file, "a", encoding="utf-8") as ff:
+                    ff.write(f"{binary}\tno_output\n")
+        except subprocess.TimeoutExpired as exc:
+            print(f"[!] Ghidra analysis timed out for {binary}: {exc}")
+            with open(fails_file, "a", encoding="utf-8") as ff:
+                ff.write(f"{binary}\ttimeout\n")
+        except subprocess.CalledProcessError as exc:
+            print(f"[!] Ghidra analysis failed for {binary}: {exc}")
+            with open(fails_file, "a", encoding="utf-8") as ff:
+                ff.write(f"{binary}\tcalled_process_error\n")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[!] Unexpected error while analyzing {binary}: {exc}")
+            with open(fails_file, "a", encoding="utf-8") as ff:
+                ff.write(f"{binary}\tunexpected_error\n")
         finally:
             if keep_project:
                 print(f"[!] Preserving temporary project at {project_dir}")
@@ -640,6 +671,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 overwrite=args.overwrite,
                 language_id=args.language_id,
                 entry_address=("ALL" if args.all_functions else args.entry_address),
+                timeout=(args.timeout if getattr(args, "timeout", 0) else None),
             )
         except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as exc:
             parser.error(str(exc))
