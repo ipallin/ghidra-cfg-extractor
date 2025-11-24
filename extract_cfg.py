@@ -377,6 +377,10 @@ def _analyze_single(
 
     This helper is safe to call concurrently from multiple threads.
     """
+    binary = binary.expanduser().resolve()
+    if not binary.is_file():
+        raise FileNotFoundError(f"Binary not found or not a file: {binary}")
+
     project_dir = Path(tempfile.mkdtemp(prefix="ghidra_cfg_"))
     project_name = binary.stem
     output_path = output_dir / (binary.name + ".cfg." + output_format)
