@@ -17,6 +17,11 @@ from typing import Tuple
 import concurrent.futures
 
 
+# Ghidra headless instances are memory- and CPU-intensive. Running too many in
+# parallel can cause failures, so keep the cap intentionally low.
+MAX_CONCURRENT_GHIDRA = 2
+
+
 # Require Python 3.10+ because the code uses the PEP 604 union syntax (e.g. "Path | None").
 if sys.version_info < (3, 10):
     sys.exit(
@@ -220,10 +225,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--workers",
         dest="workers",
         type=int,
-        default=1,
+        default=_default_worker_count(),
         help=(
-            "Number of concurrent analyses to run. Defaults to the number of CPU "
-            "cores available. Set to 1 to run sequentially."
+            "Number of concurrent analyses to run. Defaults to a small, safe level of"
+            " parallelism (up to 2) to speed up processing without overwhelming Ghidra."
+            " Set to 1 to run sequentially."
         ),
     )
     parser.add_argument(
@@ -459,6 +465,24 @@ def _get_mem_available_mb() -> int:
             return kb // 1024
     except Exception:
         return 0
+
+
+def _default_worker_count() -> int:
+    """Return a conservative default worker count.
+
+    To avoid overloading the host or Ghidra, cap the default to a small number
+    of concurrent instances while still enabling some parallelism when CPU
+    cores are available.
+    """
+
+    cpu = os.cpu_count() or 1
+    return max(1, min(cpu, MAX_CONCURRENT_GHIDRA))
+
+
+def _clamp_workers(requested: int) -> int:
+    """Clamp requested worker count to the supported maximum."""
+
+    return max(1, min(requested, MAX_CONCURRENT_GHIDRA))
 
 
 def _auto_tune_settings(requested_workers: int | None = None) -> tuple[int, list[str]]:
@@ -762,7 +786,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         parser.error("No input files found. Pass files or use --input-dir.")
         return 2
 
-    # Track temps to ensure cleanup on interruption
+    # Track temps to ensure cleanup on interruption and normal exit
     remaining_temps: List[Path] = []
 
     def _handle_terminate(signum, frame):  # noqa: ARG001
@@ -844,19 +868,26 @@ def main(argv: Iterable[str] | None = None) -> int:
         args.jvm_arg = default_jvm
         print(f"[i] Default single-worker JVM args applied: {args.jvm_arg}")
 
+    # Regardless of how the value was derived, cap concurrency to avoid running
+    # too many Ghidra instances simultaneously.
+    effective_workers = _clamp_workers(args.workers)
+    if effective_workers != args.workers:
+        print(
+            f"[i] Reducing requested worker count from {args.workers} to {effective_workers}"
+            f" to avoid running too many Ghidra instances at once (max {MAX_CONCURRENT_GHIDRA})."
+        )
+    args.workers = effective_workers
+
     # Create a worker pool to analyze binaries concurrently.
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
     futures: list[concurrent.futures.Future] = []
 
     # Per-entry processing: extract (if needed) -> validate -> submit analyze task(s)
     for entry in entries:
-        temp_dir: Path | None = None
         try:
             if zipfile.is_zipfile(entry):
                 collected, temps = _extract_zip_archive(entry, args.zip_password)
-                temp_dir = temps[0] if temps else None
-                if temp_dir:
-                    remaining_temps.append(temp_dir)
+                remaining_temps.extend(temps)
                 binaries = [p.resolve() for p in collected if _is_likely_binary(p)]
                 print(f"[i] Extracted {len(binaries)} candidate binaries from {entry.name}")
             else:
@@ -895,15 +926,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             parser.error(str(exc))
             return 2
         finally:
-            if temp_dir and not args.keep_project:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                try:
-                    remaining_temps.remove(temp_dir)
-                except ValueError:
-                    pass
             # In concurrent mode, outputs may be produced after this entry loop,
             # so avoid premature warnings here. Errors will be surfaced when
             # awaiting task futures below.
+            pass
 
     # Wait for all submitted tasks to finish and handle errors.
     executor.shutdown(wait=True)
@@ -916,6 +942,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         except Exception as exc:
             parser.error(str(exc))
             return 2
+
+    # Clean up any temporary extraction directories now that analysis has finished.
+    if not args.keep_project:
+        for td in remaining_temps:
+            shutil.rmtree(td, ignore_errors=True)
 
     return 0
 
