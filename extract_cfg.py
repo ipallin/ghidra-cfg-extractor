@@ -786,7 +786,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         parser.error("No input files found. Pass files or use --input-dir.")
         return 2
 
-    # Track temps to ensure cleanup on interruption
+    # Track temps to ensure cleanup on interruption and normal exit
     remaining_temps: List[Path] = []
 
     def _handle_terminate(signum, frame):  # noqa: ARG001
@@ -884,13 +884,10 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     # Per-entry processing: extract (if needed) -> validate -> submit analyze task(s)
     for entry in entries:
-        temp_dir: Path | None = None
         try:
             if zipfile.is_zipfile(entry):
                 collected, temps = _extract_zip_archive(entry, args.zip_password)
-                temp_dir = temps[0] if temps else None
-                if temp_dir:
-                    remaining_temps.append(temp_dir)
+                remaining_temps.extend(temps)
                 binaries = [p.resolve() for p in collected if _is_likely_binary(p)]
                 print(f"[i] Extracted {len(binaries)} candidate binaries from {entry.name}")
             else:
@@ -929,15 +926,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             parser.error(str(exc))
             return 2
         finally:
-            if temp_dir and not args.keep_project:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                try:
-                    remaining_temps.remove(temp_dir)
-                except ValueError:
-                    pass
             # In concurrent mode, outputs may be produced after this entry loop,
             # so avoid premature warnings here. Errors will be surfaced when
             # awaiting task futures below.
+            pass
 
     # Wait for all submitted tasks to finish and handle errors.
     executor.shutdown(wait=True)
@@ -950,6 +942,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         except Exception as exc:
             parser.error(str(exc))
             return 2
+
+    # Clean up any temporary extraction directories now that analysis has finished.
+    if not args.keep_project:
+        for td in remaining_temps:
+            shutil.rmtree(td, ignore_errors=True)
 
     return 0
 
