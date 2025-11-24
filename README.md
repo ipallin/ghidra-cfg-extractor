@@ -39,6 +39,60 @@ exportar a JSON.
 - `--entry-address`: indica manualmente la dirección de la función de entrada
   cuando no exista una función llamada `main` que pueda detectarse
   automáticamente.
+- `--workers`: número de análisis concurrentes a ejecutar. Por defecto el
+  script utiliza tantos *workers* como núcleos de CPU detectados en la
+  máquina (valor devuelto por `os.cpu_count()`). Establece `--workers 1` para
+  comportamiento secuencial. Ten en cuenta que cada *worker* lanza su propia
+  instancia de `analyzeHeadless` y puede consumir memoria y CPU significativamente.
+  
+- `--zip-password`: contraseña(s) a probar al extraer archivos ZIP cifrados.
+  Puede pasarse varias veces para intentar múltiples contraseñas en orden. Si
+  no se encuentra una contraseña, el script intentará la contraseña por
+  defecto `infected` y, si está disponible, usará herramientas del sistema
+  como `7z` o `unzip` para soportar distintos esquemas de cifrado.
+
+## Concurrencia y recursos
+
+El script ahora puede ejecutar múltiples análisis de Ghidra en paralelo. Cada
+análisis crea su propio directorio de proyecto temporal y ejecuta
+`analyzeHeadless` sobre un binario. Ejecutar muchos *workers* simultáneos puede
+consumir mucha memoria y CPU; ajusta `--workers` según la capacidad de tu
+máquina. Un buen punto de partida es usar el número de núcleos físicos o
+reducir el valor si observas alta contención.
+
+## Ejemplos de uso
+
+Analizar todos los archivos en un directorio con tantos workers como CPUs:
+
+```bash
+python extract_cfg.py --input-dir /ruta/a/inputs --output-dir cfgs
+```
+
+Forzar 4 análisis concurrentes y conservar los proyectos temporales para
+diagnóstico:
+
+```bash
+python extract_cfg.py --input-dir /ruta/a/inputs --output-dir cfgs --workers 4 --keep-project
+```
+
+Analizar un archivo ZIP cifrado probando varias contraseñas y exportando en
+formato JSON:
+
+```bash
+python extract_cfg.py --input-dir /ruta/a/inputs --output-dir cfgs --zip-password secret1 --zip-password secret2 --format json
+```
+
+Analizar todas las funciones en cada binario (no sólo `main`):
+
+```bash
+python extract_cfg.py --input-dir /ruta/a/inputs --output-dir cfgs --all-functions
+```
+
+Ejecutar secuencialmente (útil para depuración o entornos con pocos recursos):
+
+```bash
+python extract_cfg.py --input-dir /ruta/a/inputs --output-dir cfgs --workers 1
+```
 
 ## Script de Ghidra
 

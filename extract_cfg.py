@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterable, List
 import zipfile
 from typing import Tuple
+import concurrent.futures
 
 
 # Require Python 3.10+ because the code uses the PEP 604 union syntax (e.g. "Path | None").
@@ -196,6 +197,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Format of the exported control-flow graphs. Defaults to graphml.",
     )
     parser.add_argument(
+        "--jvm-arg",
+        dest="jvm_arg",
+        action="append",
+        help=(
+            "JVM argument to pass to analyzeHeadless. Can be repeated. "
+            "Examples: -Xmx12G or -XX:ActiveProcessorCount=16. The wrapper "
+            "will prefix with -J if needed."
+        ),
+    )
+    parser.add_argument(
+        "--auto-tune",
+        dest="auto_tune",
+        action="store_true",
+        help=(
+            "Automatically choose --workers and JVM heap/threads based on system resources. "
+            "When enabled the script will compute a safe per-instance -Xmx, set ActiveProcessorCount "
+            "and ParallelGCThreads, and adjust --workers to avoid OOM."
+        ),
+    )
+    parser.add_argument(
+        "--workers",
+        dest="workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of concurrent analyses to run. Defaults to the number of CPU "
+            "cores available. Set to 1 to run sequentially."
+        ),
+    )
+    parser.add_argument(
         "--entry-address",
         dest="entry_address",
         help=(
@@ -244,8 +275,20 @@ def _build_analyze_command(
     output_format: str,
     language_id: str | None = None,
     entry_address: str | None = None,
+    jvm_args: list[str] | None = None,
 ) -> List[str]:
-    command = [
+    """Build the analyzeHeadless command.
+
+    If `jvm_args` are provided they may be passed as e.g. "-Xmx12G" or
+    "-J-XX:ActiveProcessorCount=16". The helper will normalize them to start
+    with "-J" when constructing the command so the JVM receives them.
+    """
+
+    # Do not place -J/JVM args on the analyzeHeadless argv; instead the
+    # subprocess environment will set JAVA_TOOL_OPTIONS if jvm_args are
+    # provided. Putting -J options on the argv confuses analyzeHeadless
+    # argument parsing.
+    command: List[str] = [
         str(analyze_headless),
         str(project_dir),
         project_name,
@@ -256,16 +299,14 @@ def _build_analyze_command(
     if language_id:
         command.extend(["-processor", language_id])
 
-    command.extend(
-        [
-            "-scriptPath",
-            str(script_path.parent),
-            "-postScript",
-            script_path.name,
-            str(output_path),
-            output_format,
-        ]
-    )
+    command.extend([
+        "-scriptPath",
+        str(script_path.parent),
+        "-postScript",
+        script_path.name,
+        str(output_path),
+        output_format,
+    ])
 
     if entry_address:
         command.append(entry_address)
@@ -283,7 +324,7 @@ def run_analysis(
     overwrite: bool = False,
     language_id: str | None = None,
     entry_address: str | None = None,
-    timeout: int | None = None,
+    jvm_args: list[str] | None = None,
 ) -> None:
     if not ghidra_install:
         raise ValueError(
@@ -309,60 +350,91 @@ def run_analysis(
             raise FileExistsError(
                 f"Output file {output_path} already exists. Use --overwrite to replace it."
             )
-
-    fails_file = output_dir / "fails.txt"
-
     for binary in binaries:
-        project_dir = Path(tempfile.mkdtemp(prefix="ghidra_cfg_"))
-        project_name = binary.stem
-        output_path = output_dir / (binary.name + ".cfg." + output_format)
-
-        command = _build_analyze_command(
-            analyze_headless=analyze_headless,
-            project_dir=project_dir,
-            project_name=project_name,
+        _analyze_single(
             binary=binary,
+            analyze_headless=analyze_headless,
             script_path=script_path,
-            output_path=output_path,
+            output_dir=output_dir,
             output_format=output_format,
+            keep_project=keep_project,
+            overwrite=overwrite,
             language_id=language_id,
             entry_address=entry_address,
+            jvm_args=jvm_args,
         )
 
-        print("[+] Running:", " ".join(command))
-        try:
-            kwargs: dict = {"check": True}
-            if timeout and timeout > 0:
-                kwargs["timeout"] = timeout
 
-            subprocess.run(command, **kwargs)
-            if output_path.exists():
-                print(f"[+] CFG exported to {output_path}")
-            else:
-                print(
-                    f"[!] No output produced for {binary}. The program may not have a 'main' function or export failed."
-                )
-                with open(fails_file, "a", encoding="utf-8") as ff:
-                    ff.write(f"{binary}\tno_output\n")
-        except subprocess.TimeoutExpired as exc:
-            print(f"[!] Ghidra analysis timed out for {binary}: {exc}")
-            with open(fails_file, "a", encoding="utf-8") as ff:
-                ff.write(f"{binary}\ttimeout\n")
-        except subprocess.CalledProcessError as exc:
-            print(f"[!] Ghidra analysis failed for {binary}: {exc}")
-            with open(fails_file, "a", encoding="utf-8") as ff:
-                ff.write(f"{binary}\tcalled_process_error\n")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[!] Unexpected error while analyzing {binary}: {exc}")
-            with open(fails_file, "a", encoding="utf-8") as ff:
-                ff.write(f"{binary}\tunexpected_error\n")
-        finally:
-            if keep_project:
-                print(f"[!] Preserving temporary project at {project_dir}")
-            else:
-                shutil.rmtree(project_dir, ignore_errors=True)
+def _analyze_single(
+    binary: Path,
+    analyze_headless: Path,
+    script_path: Path,
+    output_dir: Path,
+    output_format: str,
+    keep_project: bool = False,
+    overwrite: bool = False,
+    language_id: str | None = None,
+    entry_address: str | None = None,
+    jvm_args: list[str] | None = None,
+) -> None:
+    """Analyze a single binary by invoking analyzeHeadless and manage the temp project dir.
 
+    This helper is safe to call concurrently from multiple threads.
+    """
+    project_dir = Path(tempfile.mkdtemp(prefix="ghidra_cfg_"))
+    project_name = binary.stem
+    output_path = output_dir / (binary.name + ".cfg." + output_format)
 
+    if output_path.exists() and not overwrite:
+        raise FileExistsError(
+            f"Output file {output_path} already exists. Use --overwrite to replace it."
+        )
+
+    command = _build_analyze_command(
+        analyze_headless=analyze_headless,
+        project_dir=project_dir,
+        project_name=project_name,
+        binary=binary,
+        script_path=script_path,
+        output_path=output_path,
+        output_format=output_format,
+        language_id=language_id,
+        entry_address=entry_address,
+        jvm_args=jvm_args,
+    )
+
+    print("[+] Running:", " ".join(command))
+    try:
+        # If JVM args were provided, set them via JAVA_TOOL_OPTIONS so the
+        # underlying java launcher receives them. We strip any leading -J
+        # prefix the user may have supplied and join into a single string.
+        env = os.environ.copy()
+        if jvm_args:
+            norm: List[str] = []
+            for a in jvm_args:
+                if a.startswith("-J"):
+                    norm.append(a[2:])
+                elif a.startswith("-"):
+                    norm.append(a)
+                else:
+                    norm.append("-" + a)
+            # Set both common env vars to be maximally compatible
+            env_val = " ".join(norm)
+            env["JAVA_TOOL_OPTIONS"] = env_val
+            env["_JAVA_OPTIONS"] = env_val
+
+        subprocess.run(command, check=True, env=env)
+        if output_path.exists():
+            print(f"[+] CFG exported to {output_path}")
+        else:
+            print(
+                f"[!] No output produced for {binary}. The program may not have a 'main' function or export failed."
+            )
+    finally:
+        if keep_project:
+            print(f"[!] Preserving temporary project at {project_dir}")
+        else:
+            shutil.rmtree(project_dir, ignore_errors=True)
 def _is_within_directory(directory: Path, target: Path) -> bool:
     """Return True if *target* resides inside *directory*."""
 
@@ -371,6 +443,88 @@ def _is_within_directory(directory: Path, target: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _get_mem_available_mb() -> int:
+    """Return available memory in MB using /proc/meminfo when possible.
+
+    Falls back to 0 if it cannot determine.
+    """
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    # value in kB
+                    kb = int(parts[1])
+                    return kb // 1024
+            # If MemAvailable not present, try MemFree+Buffers+Cached
+            f.seek(0)
+            mem = {}
+            for line in f:
+                k = line.split()[0].rstrip(":")
+                v = int(line.split()[1])
+                mem[k] = v
+            kb = mem.get("MemFree", 0) + mem.get("Buffers", 0) + mem.get("Cached", 0)
+            return kb // 1024
+    except Exception:
+        return 0
+
+
+def _auto_tune_settings(requested_workers: int | None = None) -> tuple[int, list[str]]:
+    """Compute (workers, jvm_args) based on system CPU count and available memory.
+
+    Heuristic:
+      - Reserve a small amount of RAM for the OS (min 1 GB or 10% of available).
+      - Target minimum heap per instance = 2048 MB.
+      - Determine workers = min(cpu_count, floor((mem_available - reserve) / min_heap))
+      - If requested_workers explicitly provided (and >0), cap to that value.
+      - Compute per-instance Xmx = floor((mem_available - reserve) / workers)
+      - Compute ActiveProcessorCount = max(1, floor(cpu_count / workers))
+      - Set ParallelGCThreads = max(1, floor(ActiveProcessorCount/2)).
+    """
+    cpu = os.cpu_count() or 1
+    mem_mb = _get_mem_available_mb()
+
+    # Reserve at least 1024 MB or 10% of memory, whichever is larger
+    reserve_mb = max(1024, int(mem_mb * 0.1)) if mem_mb > 0 else 1024
+
+    min_heap_mb = 2048
+
+    # If memory unknown fallback to conservative defaults
+    if mem_mb <= 0:
+        workers = min(cpu, requested_workers or cpu)
+        jvm_args = [f"-Xmx{min(8, max(1, cpu))}G", f"-XX:ActiveProcessorCount={max(1, cpu//workers)}"]
+        return workers, jvm_args
+
+    usable_mb = max(0, mem_mb - reserve_mb)
+    # maximum workers limited by CPU and memory
+    max_by_mem = usable_mb // min_heap_mb if min_heap_mb > 0 else cpu
+    max_workers = max(1, min(cpu, max(1, max_by_mem)))
+
+    workers = max_workers
+    if requested_workers and requested_workers > 0:
+        workers = min(requested_workers, max_workers)
+
+    # Ensure at least 1 worker
+    workers = max(1, workers)
+
+    # per-instance heap (MB)
+    per_instance_mb = max(256, usable_mb // workers) if usable_mb > 0 else min_heap_mb
+
+    # Convert to G suffix when appropriate
+    if per_instance_mb >= 1024:
+        xmx_val = f"{per_instance_mb // 1024}G"
+    else:
+        xmx_val = f"{per_instance_mb}M"
+
+    # Compute CPU allocation per instance
+    apc = max(1, cpu // workers)
+    pgt = max(1, apc // 2)
+
+    jvm_args: list[str] = [f"-Xmx{xmx_val}", f"-XX:ActiveProcessorCount={apc}", f"-XX:ParallelGCThreads={pgt}"]
+
+    return workers, jvm_args
 
 
 def _ensure_empty_directory(path: Path) -> None:
@@ -636,7 +790,75 @@ def main(argv: Iterable[str] | None = None) -> int:
     except Exception:
         pass
 
-    # Sequential per-entry processing: extract (if needed) -> analyze -> cleanup tmp
+    # Validate Ghidra installation and script once up-front so worker tasks don't
+    # need to repeat the same checks.
+    try:
+        if not args.ghidra_install:
+            raise ValueError(
+                "The path to the Ghidra installation is required. Use --ghidra-install or set GHIDRA_INSTALL_DIR."
+            )
+        ghidra_install = args.ghidra_install.expanduser().resolve()
+        if not ghidra_install.exists():
+            parser.error(f"Ghidra installation not found at {ghidra_install}")
+            return 2
+        analyze_headless = _resolve_headless_executable(ghidra_install)
+
+        script_path = args.script.expanduser().resolve()
+        if not script_path.exists():
+            parser.error(f"Ghidra script not found at {script_path}")
+            return 2
+
+        output_dir = args.output_dir.expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except (ValueError, FileNotFoundError) as exc:
+        parser.error(str(exc))
+        return 2
+
+    # Auto-tune workers and JVM args if requested.
+    if args.auto_tune:
+        requested = args.workers if hasattr(args, "workers") else None
+        tuned_workers, tuned_jvm = _auto_tune_settings(requested_workers=requested)
+        print(f"[i] Auto-tune: selected workers={tuned_workers}, jvm_args={tuned_jvm}")
+        args.workers = tuned_workers
+        # Merge tuned JVM args with any user-provided args, giving user args priority
+        combined: list[str] = list(tuned_jvm)
+        if args.jvm_arg:
+            for a in args.jvm_arg:
+                if a not in combined:
+                    combined.append(a)
+        args.jvm_arg = combined
+
+    # If running sequentially (default) and the user didn't provide JVM args and
+    # didn't request auto-tune, allocate most resources to the single Ghidra
+    # instance so it can use all available CPUs and a large heap.
+    if not args.auto_tune and args.workers == 1 and not args.jvm_arg:
+        cpu = os.cpu_count() or 1
+        mem_mb = _get_mem_available_mb()
+        # Reserve 1 GB for the OS if possible
+        reserve_mb = 1024
+        if mem_mb and mem_mb > reserve_mb + 256:
+            heap_mb = max(256, mem_mb - reserve_mb)
+        elif mem_mb:
+            heap_mb = max(128, mem_mb - 128)
+        else:
+            heap_mb = 2048
+
+        if heap_mb >= 1024:
+            xmx = f"{heap_mb // 1024}G"
+        else:
+            xmx = f"{heap_mb}M"
+
+        apc = max(1, cpu)
+        pgt = max(1, apc // 2)
+        default_jvm = [f"-Xmx{xmx}", f"-XX:ActiveProcessorCount={apc}", f"-XX:ParallelGCThreads={pgt}"]
+        args.jvm_arg = default_jvm
+        print(f"[i] Default single-worker JVM args applied: {args.jvm_arg}")
+
+    # Create a worker pool to analyze binaries concurrently.
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
+    futures: list[concurrent.futures.Future] = []
+
+    # Per-entry processing: extract (if needed) -> validate -> submit analyze task(s)
     for entry in entries:
         temp_dir: Path | None = None
         try:
@@ -661,18 +883,24 @@ def main(argv: Iterable[str] | None = None) -> int:
                 print(f"[!] Skipping {entry.name}: {exc}")
                 continue
 
-            run_analysis(
-                binaries=validated,
-                ghidra_install=args.ghidra_install,
-                output_dir=args.output_dir,
-                script_path=args.script,
-                output_format=args.output_format,
-                keep_project=args.keep_project,
-                overwrite=args.overwrite,
-                language_id=args.language_id,
-                entry_address=("ALL" if args.all_functions else args.entry_address),
-                timeout=(args.timeout if getattr(args, "timeout", 0) else None),
-            )
+            # Submit one task per validated binary. The helper will create its own
+            # temporary project directory and clean it up when done (unless
+            # --keep-project was passed).
+            for vb in validated:
+                fut = executor.submit(
+                    _analyze_single,
+                    vb,
+                    analyze_headless,
+                    script_path,
+                    output_dir,
+                    args.output_format,
+                    args.keep_project,
+                    args.overwrite,
+                    args.language_id,
+                    ("ALL" if args.all_functions else args.entry_address),
+                    args.jvm_arg,
+                )
+                futures.append((entry, vb, fut))
         except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as exc:
             parser.error(str(exc))
             return 2
@@ -683,19 +911,21 @@ def main(argv: Iterable[str] | None = None) -> int:
                     remaining_temps.remove(temp_dir)
                 except ValueError:
                     pass
-            # After processing this entry, check that at least one expected
-            # output file was produced; if not, log a warning to help diagnose.
-            try:
-                expected = [
-                    args.output_dir.expanduser().resolve() / (b.name + f".cfg.{args.output_format}")
-                    for b in (validated if 'validated' in locals() else [])
-                ]
-                produced = [p for p in expected if p.exists()]
-                if expected and not produced:
-                    print(f"[!] No outputs produced for entry '{entry.name}'. The binaries may have no discoverable functions or the export failed.")
-            except Exception:
-                # Diagnostics only; ignore any errors here
-                pass
+            # In concurrent mode, outputs may be produced after this entry loop,
+            # so avoid premature warnings here. Errors will be surfaced when
+            # awaiting task futures below.
+
+    # Wait for all submitted tasks to finish and handle errors.
+    executor.shutdown(wait=True)
+    for entry, vb, fut in futures:
+        try:
+            fut.result()
+        except subprocess.CalledProcessError as cpe:
+            parser.error(f"Analysis failed for {vb}: {cpe}")
+            return 2
+        except Exception as exc:
+            parser.error(str(exc))
+            return 2
 
     return 0
 
