@@ -359,13 +359,21 @@ def run_analysis(
     temp_root = (temp_root or Path("/tmp")).expanduser().resolve()
     temp_root.mkdir(parents=True, exist_ok=True)
 
+    binaries_to_analyze: list[Path] = []
     for binary in binaries:
         output_path = output_dir / (binary.name + ".cfg." + output_format)
         if output_path.exists() and not overwrite:
-            raise FileExistsError(
-                f"Output file {output_path} already exists. Use --overwrite to replace it."
+            print(
+                f"[i] Skipping {binary}: {output_path.name} already exists (use --overwrite to regenerate)."
             )
-    for binary in binaries:
+            continue
+        binaries_to_analyze.append(binary)
+
+    if not binaries_to_analyze:
+        print("[i] Nothing to analyze; all outputs already exist. Use --overwrite to force regeneration.")
+        return
+
+    for binary in binaries_to_analyze:
         _analyze_single(
             binary=binary,
             analyze_headless=analyze_headless,
@@ -407,9 +415,10 @@ def _analyze_single(
     output_path = output_dir / (binary.name + ".cfg." + output_format)
 
     if output_path.exists() and not overwrite:
-        raise FileExistsError(
-            f"Output file {output_path} already exists. Use --overwrite to replace it."
+        print(
+            f"[i] Skipping {binary}: {output_path.name} already exists (use --overwrite to regenerate)."
         )
+        return
 
     command = _build_analyze_command(
         analyze_headless=analyze_headless,
