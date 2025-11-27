@@ -162,6 +162,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory where the CFG export files will be stored.",
     )
     parser.add_argument(
+        "--temp-dir",
+        dest="temp_dir",
+        type=Path,
+        default=Path("/tmp"),
+        help=(
+            "Base directory for temporary files (ZIP extractions and Ghidra projects). "
+            "Defaults to /tmp but can be pointed to a faster or larger volume."
+        ),
+    )
+    parser.add_argument(
         "--keep-project",
         dest="keep_project",
         action="store_true",
@@ -258,6 +268,16 @@ def build_parser() -> argparse.ArgumentParser:
             "will still be attempted if no password succeeds."
         ),
     )
+    parser.add_argument(
+        "--timeout",
+        dest="timeout",
+        type=int,
+        default=0,
+        help=(
+            "Optional per-binary timeout in seconds for the Ghidra headless analysis. "
+            "If set to 0 (default), no timeout is applied."
+        ),
+    )
     return parser
 
 
@@ -321,6 +341,8 @@ def run_analysis(
     language_id: str | None = None,
     entry_address: str | None = None,
     jvm_args: list[str] | None = None,
+    temp_root: Path | None = None,
+    timeout: int | float | None = None,
 ) -> None:
     if not ghidra_install:
         raise ValueError(
@@ -340,13 +362,24 @@ def run_analysis(
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    temp_root = (temp_root or Path("/tmp")).expanduser().resolve()
+    temp_root.mkdir(parents=True, exist_ok=True)
+
+    binaries_to_analyze: list[Path] = []
     for binary in binaries:
         output_path = output_dir / (binary.name + ".cfg." + output_format)
         if output_path.exists() and not overwrite:
-            raise FileExistsError(
-                f"Output file {output_path} already exists. Use --overwrite to replace it."
+            print(
+                f"[i] Skipping {binary}: {output_path.name} already exists (use --overwrite to regenerate)."
             )
-    for binary in binaries:
+            continue
+        binaries_to_analyze.append(binary)
+
+    if not binaries_to_analyze:
+        print("[i] Nothing to analyze; all outputs already exist. Use --overwrite to force regeneration.")
+        return
+
+    for binary in binaries_to_analyze:
         _analyze_single(
             binary=binary,
             analyze_headless=analyze_headless,
@@ -358,6 +391,8 @@ def run_analysis(
             language_id=language_id,
             entry_address=entry_address,
             jvm_args=jvm_args,
+            temp_root=temp_root,
+            timeout=timeout,
         )
 
 
@@ -372,6 +407,8 @@ def _analyze_single(
     language_id: str | None = None,
     entry_address: str | None = None,
     jvm_args: list[str] | None = None,
+    temp_root: Path | None = None,
+    timeout: int | float | None = None,
 ) -> None:
     """Analyze a single binary by invoking analyzeHeadless and manage the temp project dir.
 
@@ -386,9 +423,10 @@ def _analyze_single(
     output_path = output_dir / (binary.name + ".cfg." + output_format)
 
     if output_path.exists() and not overwrite:
-        raise FileExistsError(
-            f"Output file {output_path} already exists. Use --overwrite to replace it."
+        print(
+            f"[i] Skipping {binary}: {output_path.name} already exists (use --overwrite to regenerate)."
         )
+        return
 
     command = _build_analyze_command(
         analyze_headless=analyze_headless,
@@ -423,13 +461,20 @@ def _analyze_single(
             env["JAVA_TOOL_OPTIONS"] = env_val
             env["_JAVA_OPTIONS"] = env_val
 
-        subprocess.run(command, check=True, env=env)
+        run_timeout = None
+        if timeout and timeout > 0:
+            run_timeout = timeout
+
+        subprocess.run(command, check=True, env=env, timeout=run_timeout)
         if output_path.exists():
             print(f"[+] CFG exported to {output_path}")
         else:
             print(
                 f"[!] No output produced for {binary}. The program may not have a 'main' function or export failed."
             )
+    except subprocess.TimeoutExpired:
+        print(f"[!] Analysis timed out after {timeout} seconds for {binary}")
+        raise
     finally:
         if keep_project:
             print(f"[!] Preserving temporary project at {project_dir}")
@@ -588,10 +633,16 @@ def _safe_extract_zip(zip_path: Path, destination: Path, password: bytes | None 
             archive.extractall(destination, pwd=password)
 
 
-def _extract_zip_archive(entry: Path, zip_passwords: list[str] | None = None) -> Tuple[List[Path], List[Path]]:
+def _extract_zip_archive(
+    entry: Path,
+    zip_passwords: list[str] | None = None,
+    temp_root: Path | None = None,
+) -> Tuple[List[Path], List[Path]]:
     """Extract *entry* (a ZIP archive) and return collected files and temp dirs."""
 
-    temp_dir = Path(tempfile.mkdtemp(prefix="gh_extract_"))
+    base_temp = (temp_root or Path(tempfile.gettempdir())).expanduser().resolve()
+    base_temp.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix="gh_extract_", dir=str(base_temp)))
     passwords: list[str] = list(zip_passwords or [])
     if "infected" not in passwords:
         passwords.append("infected")
@@ -704,7 +755,11 @@ def _extract_zip_archive(entry: Path, zip_passwords: list[str] | None = None) ->
         return [], []
 
 
-def _collect_from_path(path: Path, zip_passwords: list[str] | None = None) -> Tuple[List[Path], List[Path]]:
+def _collect_from_path(
+    path: Path,
+    zip_passwords: list[str] | None = None,
+    temp_root: Path | None = None,
+) -> Tuple[List[Path], List[Path]]:
     """Collect binaries from *path* which may be a file or directory."""
 
     path = path.expanduser().resolve()
@@ -712,15 +767,19 @@ def _collect_from_path(path: Path, zip_passwords: list[str] | None = None) -> Tu
         raise FileNotFoundError(f"Input path not found: {path}")
 
     if path.is_dir():
-        return _gather_from_input_dir(path, zip_passwords)
+        return _gather_from_input_dir(path, zip_passwords, temp_root=temp_root)
 
     if zipfile.is_zipfile(path):
-        return _extract_zip_archive(path, zip_passwords)
+        return _extract_zip_archive(path, zip_passwords, temp_root=temp_root)
 
     return [path], []
 
 
-def _gather_from_input_dir(input_dir: Path, zip_passwords: list[str] | None = None) -> Tuple[List[Path], List[Path]]:
+def _gather_from_input_dir(
+    input_dir: Path,
+    zip_passwords: list[str] | None = None,
+    temp_root: Path | None = None,
+) -> Tuple[List[Path], List[Path]]:
     """Collect binaries from `input_dir`.
 
     Returns a tuple (binaries, temp_dirs) where `temp_dirs` are any temporary
@@ -741,7 +800,7 @@ def _gather_from_input_dir(input_dir: Path, zip_passwords: list[str] | None = No
             continue
 
         if zipfile.is_zipfile(entry):
-            files, temps = _extract_zip_archive(entry, zip_passwords)
+            files, temps = _extract_zip_archive(entry, zip_passwords, temp_root=temp_root)
             collected.extend(files)
             temp_dirs.extend(temps)
         else:
@@ -795,9 +854,8 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     def _handle_terminate(signum, frame):  # noqa: ARG001
         try:
-            if not args.keep_project:
-                for td in list(remaining_temps):
-                    shutil.rmtree(td, ignore_errors=True)
+            for td in list(extract_temp_dirs):
+                shutil.rmtree(td, ignore_errors=True)
         finally:
             code = 130 if signum == signal.SIGINT else 143
             os._exit(code)
@@ -810,6 +868,8 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     # Validate Ghidra installation and script once up-front so worker tasks don't
     # need to repeat the same checks.
+    temp_root: Path | None = None
+
     try:
         if not args.ghidra_install:
             raise ValueError(
@@ -828,9 +888,14 @@ def main(argv: Iterable[str] | None = None) -> int:
 
         output_dir = args.output_dir.expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        temp_root = args.temp_dir.expanduser().resolve()
+        temp_root.mkdir(parents=True, exist_ok=True)
     except (ValueError, FileNotFoundError) as exc:
         parser.error(str(exc))
         return 2
+
+    assert temp_root is not None
 
     # Auto-tune workers and JVM args if requested.
     if args.auto_tune:
@@ -924,8 +989,11 @@ def main(argv: Iterable[str] | None = None) -> int:
                     args.language_id,
                     ("ALL" if args.all_functions else args.entry_address),
                     args.jvm_arg,
+                    temp_root,
+                    args.timeout,
                 )
                 futures.append((entry, vb, fut))
+                submitted_tasks = True
         except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as exc:
             parser.error(str(exc))
             return 2
@@ -940,6 +1008,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     for entry, vb, fut in futures:
         try:
             fut.result()
+        except subprocess.TimeoutExpired:
+            parser.error(
+                f"Analysis timed out for {vb} after {args.timeout} seconds"
+            )
+            return 2
         except subprocess.CalledProcessError as cpe:
             parser.error(f"Analysis failed for {vb}: {cpe}")
             return 2

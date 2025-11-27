@@ -30,6 +30,9 @@ exportar a JSON.
 - `--keep-project`: conserva el proyecto temporal de Ghidra creado durante el
   análisis.
 - `--overwrite`: permite sobreescribir archivos de salida existentes.
+- `--temp-dir`: base utilizada para crear los directorios temporales de
+  extracción de ZIPs y proyectos de Ghidra. Por defecto apunta a `/tmp`, pero
+  puedes redirigirla a un disco con más espacio o a un SSD más rápido.
 - `--script`: ruta personalizada a un *post-script* de Ghidra. Por defecto se
   utiliza `ghidra_scripts/export_cfg.py` incluido en este repositorio.
 - `--language-id`: fuerza el *language*/*processor* de Ghidra (por ejemplo,
@@ -50,6 +53,9 @@ exportar a JSON.
   no se encuentra una contraseña, el script intentará la contraseña por
   defecto `infected` y, si está disponible, usará herramientas del sistema
   como `7z` o `unzip` para soportar distintos esquemas de cifrado.
+- `--timeout`: límite (en segundos) para cada análisis de Ghidra. Si un
+  binario supera ese tiempo, el proceso se aborta para ese archivo concreto y
+  el resto del lote continúa.
 
 ## Concurrencia y recursos
 
@@ -80,6 +86,12 @@ formato JSON:
 
 ```bash
 python extract_cfg.py --input-dir /ruta/a/inputs --output-dir cfgs --zip-password secret1 --zip-password secret2 --format json
+```
+
+Enviar los temporales a un disco dedicado (por ejemplo `/mnt/ssd/tmp`):
+
+```bash
+python extract_cfg.py --input-dir /ruta/a/inputs --output-dir cfgs --temp-dir /mnt/ssd/tmp
 ```
 
 Analizar todas las funciones en cada binario (no sólo `main`):
